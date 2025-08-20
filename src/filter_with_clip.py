@@ -1,4 +1,5 @@
 # src/filter_with_clip.py
+
 import os
 import glob
 import math
@@ -7,7 +8,7 @@ import numpy as np
 from PIL import Image
 from transformers import CLIPModel, CLIPTokenizer, CLIPImageProcessor
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import multiprocessing
 
 def load_clip_model(device: str = None):
     """
@@ -193,6 +194,9 @@ def filter_with_clip(
                 pass
 
     # parallel execution
+    if max_workers is None:
+        max_workers = max(1, multiprocessing.cpu_count() - 2)
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_worker, batch) for batch in batches]
         for fut in as_completed(futures):
