@@ -1,6 +1,5 @@
 # requirements.txt
 
-PyMuPDF
 Pillow
 numpy
 opencv-python
@@ -9,3 +8,13 @@ transformers
 paddlepaddle
 paddleocr
 layoutparser
+PyMuPDF
+spacy
+nltk
+scikit-learn
+scikit-image
+tensorflow
+keras
+matplotlib
+tqdm
+pydensecrf

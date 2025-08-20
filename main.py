@@ -1,114 +1,207 @@
-# main
+# main.py
 
 import os
+import glob
 import torch
-from src.extract_images import extract_images_from_pdf
+
+from src.extract_images import extract_images_pipeline
 from src.filter_with_clip import filter_with_clip
+from src.skin_classification import classify_skin
+from src.text_parser import analyze_text
+
+# Pipeline control flags
+RUN_EXTRACTION = False          # Extract images from PDF
+RUN_FILTER_PHOTO = False        # Filter images into photos vs illustrations
+RUN_FILTER_SKIN = False         # Filter photos into skin vs no_skin
+RUN_SKIN_CLASSER = True         # Identify skin tone
+RUN_RACE_IDENTIFIER = False     # Filter race using CLIP
+RUN_TEXT = False                # Run text analysis
+
+abd_model_path = "models/abd-skin-segmentation/final_unet_pytorch.pth"
+
+
+def process_pdf(pdf_path: str):
+    # Derive base name (without extension) for this textbook
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    # Create a separate data directory for each textbook
+    base_dir = os.path.join("data", base_name)
+    extracted_dir = os.path.join(base_dir, "extracted_images")
+    sorted_dir = os.path.join(base_dir, "sorted_images")
+    photo_sort_dir = os.path.join(sorted_dir, "photo_illus")
+    skin_sort_dir = os.path.join(sorted_dir, "if_skin")
+    race_sort_dir = os.path.join(sorted_dir, "race")
+    skin_class_dir = os.path.join(base_dir, "skin_class")
+    text_dir = os.path.join(base_dir, "text_analysis")
+
+    # Ensure directories exist
+    for d in (
+            base_dir,
+            extracted_dir,
+            sorted_dir,
+            photo_sort_dir,
+            skin_sort_dir,
+            race_sort_dir,
+            skin_class_dir,
+            text_dir
+    ):
+        os.makedirs(d, exist_ok=True)
+
+    # Step 1: Extract all images from the PDF
+    if RUN_EXTRACTION:
+        extract_images_pipeline(
+            pdf_path=pdf_path,
+            output_dir=extracted_dir,
+        )
+
+    # Step 2: First-level CLIP filtering (photos vs illustrations)
+    if RUN_FILTER_PHOTO:
+        photo_labels = [
+            "a photograph",
+            "a high-resolution photo",
+            "a low-resolution photo",
+            "a real-life photo",
+            "a photo taken with a camera",
+        ]
+
+        illus_labels = [
+            "a drawing",
+            "a textbook illustration",
+            "a computer generated illustration"
+        ]
+
+        text_labels = [
+            "a portion of text",
+            "text on a page",
+            "a blank page"
+        ]
+
+        filter_with_clip(
+            input_folder=os.path.join(extracted_dir, "bbox_crops"),
+            output_folder=photo_sort_dir,
+            use_mean=True,
+            categories={
+                "photo": photo_labels,
+                "illus": illus_labels,
+                "text": text_labels
+            },
+            max_workers=10
+        )
+
+    # Step 3: Second-level CLIP filtering (skin vs no_skin)
+    if RUN_FILTER_SKIN:
+        skin_labels = [
+            "a human",
+            "human skin",
+            "a skin condition",
+            "a leg",
+            "a foot",
+            "an arm",
+            "a hand",
+            "a patient's torso",
+            "a patient's back",
+            "a face",
+            "a mouth",
+            "a tongue",
+            "an ear",
+            "a nose",
+            "a finger",
+            "a patient's hair",
+            "a wart",
+        ]
+        noskin_labels = [
+            "a microscopic photo",
+            "a photo through a microscope",
+            "a biological cell",
+            "a group of cells",
+            "a molecule",
+            "medical equipment",
+            "a medical experiment",
+            "a tool",
+            "a page with text",
+            "a blank page",
+            "a screenshot with text",
+            "a photograph of internal anatomy",
+            "the inside of a mouth",
+            "internal photograph of an organ"
+        ]
+        filter_with_clip(
+            input_folder=os.path.join(photo_sort_dir, "photo"),
+            output_folder=skin_sort_dir,
+            use_mean=False,
+            categories={
+                "skin": skin_labels,
+                "no_skin": noskin_labels,
+            },
+            max_workers=10
+        )
+
+    if RUN_SKIN_CLASSER:
+        classify_skin(input_dir=os.path.join(skin_sort_dir, "skin"),
+                      output_dir=skin_class_dir,
+                      abd_model_path=abd_model_path,
+                      workers=10)
+
+    if RUN_RACE_IDENTIFIER:
+        white_labels = [
+            "a caucasian patient",
+            "a white person's skin",
+            "caucasian skin",
+            "white skin",
+            "fair skin"
+        ]
+        black_labels = [
+            "a black patient",
+            "a black person's skin",
+            "black skin",
+            "african skin",
+            "dark skin"
+        ]
+        asian_labels = [
+            "an asian patient",
+            "a asian person's skin",
+            "asian skin",
+        ]
+        latino_labels = [
+            "a latino patient",
+            "a latino person's skin",
+            "latino skin",
+        ]
+
+        filter_with_clip(
+            input_folder=os.path.join(skin_sort_dir, "skin"),
+            output_folder=race_sort_dir,
+            use_mean=True,
+            categories={
+                "white": white_labels,
+                "black": black_labels,
+                "asian": asian_labels,
+                "latino": latino_labels
+            },
+            max_workers=10
+        )
+    if RUN_TEXT:
+        analyze_text(
+            input_folder=base_dir,
+            output_folder=text_dir,
+        )
+
+    print(f"Finished processing '{base_name}'")
 
 
 def main():
-    pdf_path = "data/textbook1.pdf"
-    extracted_dir = "data/extracted_images"
-    sorted_images = "data/sorted_images"
-    os.makedirs(extracted_dir, exist_ok=True)
-    os.makedirs(sorted_images, exist_ok=True)
+    # Find all PDF files in the input folder
+    input_pattern = os.path.join("textbook_inputs", "*.pdf")
+    all_pdfs = glob.glob(input_pattern)
 
-    # 1. Extract all extracted_images from PDF
-    # extract_images_from_pdf(pdf_path=pdf_path, output_dir=extracted_dir, use_ocr=False)
+    if not all_pdfs:
+        print("No PDF files found in 'textbook_inputs' directory.")
+        return
 
-    # 2. Filter extracted_images into photos vs. illustrations
-    photo_labels = [
-        "a photograph",
-        "a high-resolution photo",
-        "a DSLR photo",
-        "a real-life photo",
-        "a photo taken with a camera",
-        "a snapshot"
-    ]
+    for pdf_path in all_pdfs:
+        process_pdf(pdf_path)
 
-    illus_labels = [
-        "a drawing",
-        "digital art",
-        "a cartoon",
-        "an illustration",
-        "a portion of text",
-        "a blank page"
-    ]
+    print("Pipeline complete for all textbooks.")
 
-    filter_with_clip(
-        input_folder="data/extracted_images/bounding_boxes",
-        output_folder=sorted_images,
-        use_mean=True,
-        categories={
-        "photo": photo_labels,
-        "illus": illus_labels
-        },
-        max_workers=10
-    )
-
-    # 2. Filter photos into skin and no skin
-    skin_labels = [
-        "a human",
-        "human skin",
-        "a skin lesion",
-        "a skin condition",
-        "a leg",
-        "a foot",
-        "an arm",
-        "a hand",
-        "a patient's torso",
-        "a patient's back",
-        "a face",
-        "a mouth",
-        "a tongue",
-        "an ear",
-        "a nose",
-        "a finger"
-    ]
-
-    noskin_labels = [
-        "a microscopic photo",
-        "a micrograph",
-        "a biological cell",
-        "a group of cells",
-        "a molecule",
-        "medical equipment",
-        "a tool",
-        "a page with text",
-        "a blank page",
-    ]
-
-    filter_with_clip(
-        input_folder="data/sorted_images/photo",
-        output_folder=sorted_images,
-        categories={
-        "skin": skin_labels,
-        "no_skin": noskin_labels
-        },
-        max_workers=10
-    )
-
-
-    '''
-    # 3. Analyze each photo
-    csv_path = os.path.join(results_dir, "skin_tone_results.csv")
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Image", "Avg_L", "Avg_A", "Avg_B", "Fitz_Tone"])
-        for img_file in os.listdir(photos_dir):
-            img_path = os.path.join(photos_dir, img_file)
-            img = cv2.imread(img_path)
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            skin_mask = segment_skin(img_rgb)
-            healthy_mask = remove_lesions(skin_mask, img_rgb)
-            avg_L, avg_A, avg_B = compute_skin_lab(healthy_mask, img_rgb)
-            tone = classify_fitzpatrick(avg_A, avg_B)  # define this in analyze_skin.py
-
-            writer.writerow([img_file, avg_L, avg_A, avg_B, tone])
-
-    '''
-    print("Pipeline complete. Check data/results/ for outputs.")
 
 if __name__ == "__main__":
     main()
