@@ -2,17 +2,20 @@ Work in progress pipeline for dermatology textbook photograph race identificatio
 
 Please import requirements.txt before using
 
-For ML skin segmentation, please clone this Git repository: https://github.com/HanXuMartin/SkinSegmentation
-Download the Unet model in the README and put it under SkinSegmentation/workdir/Unet-10/
+Abd skin segmentation: https://github.com/MRE-Lab-UMD/abd-skin-segmentation/tree/master
+Download Models/final_unet_pytorch.pth and create /models/abd-skin-segmentation/
+
 
 TODO
 internal anatomy filtering
 
+write guide
+
+OLD
 add setup files to download
 https://www.dropbox.com/s/d9fc9tahfzyl6df/model_final.pth?dl=1
 https://www.dropbox.com/s/u9wbsfwz4y0ziki/config.yml?dl=1
 
 might need to write setup for detectron2
 
-write guide
 
