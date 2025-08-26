@@ -5,6 +5,8 @@ Please import requirements.txt before using
 Abd skin segmentation: https://github.com/MRE-Lab-UMD/abd-skin-segmentation/tree/master
 Download Models/final_unet_pytorch.pth and create /models/abd-skin-segmentation/
 
+paddle install: https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/windows-pip.html
+Then pip install "paddleocr[all]"
 
 TODO
 internal anatomy filtering

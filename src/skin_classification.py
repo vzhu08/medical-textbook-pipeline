@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 ABD skin segmentation (PyTorch UNet) + STRICT CRF + HSV fallback + light cleanup
+GPU-aware: set use_gpu=True (and CUDA available) to run single-process batched
+inference on GPU with mixed precision. Fallbacks to CPU otherwise.
 
 Pipeline:
   1) Segment with UNet → per-pixel probabilities (saved if CRF is on)
@@ -33,10 +35,20 @@ import cv2
 import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Optional
+from contextlib import nullcontext
 import concurrent.futures
+
+import pydensecrf.densecrf as dcrf
+from pydensecrf.utils import unary_from_softmax
 
 import torch
 import torch.nn as nn
+
+# Prefer cuDNN autotune when on GPU
+try:
+    torch.backends.cudnn.benchmark = True
+except Exception:
+    pass
 
 # ------------------------------ Config ------------------------------
 EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -60,7 +72,7 @@ CRF_UNARY_SCALE = 2.5
 
 # --- Fallback & cleanup knobs ---
 FALLBACK_MIN_COVERAGE_FRAC = 0.10  # if CRF mask covers <10%, use HSV fallback
-EDGE_ERODE_FRAC = 0.01   # shrink mask by ~1% of min(H, W)
+EDGE_ERODE_FRAC = 0.01             # shrink mask by ~1% of min(H, W)
 SMALL_COMP_FRAC = 0.01             # remove CCs <1% of image area
 
 # HSV skin ranges (OpenCV: H 0..179, S/V 0..255); union of two hue bands
@@ -68,6 +80,21 @@ HSV1_LO = (0,   30,  60)
 HSV1_HI = (25, 180, 255)
 HSV2_LO = (160, 30,  60)
 HSV2_HI = (179, 180, 255)
+
+# --- helper: torch API for CUDA ---
+def _amp_autocast(device: str, enabled: bool):
+    # Use the new torch.amp.autocast on CUDA; no-op elsewhere
+    if enabled and device.startswith("cuda"):
+        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+# --- helper: ensures each post-processing worker doesn't spawn OpenCV inner threads ---
+def _init_post_worker():
+    try:
+        import cv2
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
 
 # --- helper: expected outputs for a given file ---
 def _expected_outputs_for(fname: str, output_dir: str):
@@ -214,7 +241,7 @@ def _init_abd_worker(model_path: str, input_size: int, thr: float, batch_size: i
         pass
     _torch.set_num_threads(1)
     global _G_MODEL, _G_DEVICE, _G_IN_SIZE, _G_THR, _G_BATCH, _G_SAVE_PROBS, _G_PROBS_DIR
-    _G_DEVICE = "cpu"
+    _G_DEVICE = "cpu"  # workers are CPU-only
     _G_IN_SIZE = int(input_size)
     _G_THR = float(thr)
     _G_BATCH = int(batch_size)
@@ -223,7 +250,7 @@ def _init_abd_worker(model_path: str, input_size: int, thr: float, batch_size: i
     _G_MODEL, _ = abd_load_torch_unet(model_path, device=_G_DEVICE)
 
 @torch.inference_mode()
-def _predict_chunk(img_paths, in_size, thr, model, device, return_probs: bool = False):
+def _predict_chunk(img_paths, in_size, thr, model, device, return_probs: bool = False, use_amp: bool = False):
     outs = []
     batch, metas = [], []
     for p in img_paths:
@@ -237,9 +264,13 @@ def _predict_chunk(img_paths, in_size, thr, model, device, return_probs: bool = 
         batch.append(x); metas.append((p, h0, w0))
     if not batch:
         return outs
-    X = torch.from_numpy(np.stack(batch, 0)).to(device)
-    # If your model lacks sigmoid: y = torch.sigmoid(model(X)[:, 0]).cpu().numpy()
-    y = model(X)[:, 0].cpu().numpy()
+
+    X = torch.from_numpy(np.stack(batch, 0)).to(device, non_blocking=True)
+    # Mixed precision on CUDA only
+    with _amp_autocast(device, use_amp):
+        y = model(X)[:, 0]
+    y = y.float().cpu().numpy()  # back to float32 on CPU for CV ops
+
     for (p, h0, w0), yi in zip(metas, y):
         prob = cv2.resize(yi, (w0, h0), interpolation=cv2.INTER_LINEAR).astype(np.float32)
         m = (prob > thr).astype(np.uint8) * 255
@@ -251,7 +282,7 @@ def _abd_worker_chunk(paths: List[str], masks_dir: str) -> int:
     model = _G_MODEL
     for i in range(0, len(paths), _G_BATCH):
         chunk = paths[i:i+_G_BATCH]
-        preds = _predict_chunk(chunk, _G_IN_SIZE, _G_THR, model, _G_DEVICE, return_probs=_G_SAVE_PROBS)
+        preds = _predict_chunk(chunk, _G_IN_SIZE, _G_THR, model, _G_DEVICE, return_probs=_G_SAVE_PROBS, use_amp=False)
         for item in preds:
             if _G_SAVE_PROBS:
                 p, m, prob = item
@@ -260,7 +291,7 @@ def _abd_worker_chunk(paths: List[str], masks_dir: str) -> int:
             cv2.imwrite(os.path.join(masks_dir, os.path.basename(p)), m)
             if _G_SAVE_PROBS and _G_PROBS_DIR:
                 stem = os.path.splitext(os.path.basename(p))[0]
-                np.save(os.path.join(_G_PROBS_DIR, f"{stem}.npy"), prob)
+                np.save(os.path.join(_G_PROBS_DIR, f"{stem}.npy"), prob.astype(np.float32))
             total += 1
     return total
 
@@ -276,7 +307,8 @@ def run_segmentation_abd(
     files_per_worker: int = 256,
     save_probs: bool = False,
     probs_dir: Optional[str] = None,
-    prob_format: str = "npy"
+    prob_format: str = "npy",
+    use_gpu: bool = True,  # <— NEW: GPU toggle
 ) -> None:
     os.makedirs(masks_dir, exist_ok=True)
     if save_probs:
@@ -288,19 +320,25 @@ def run_segmentation_abd(
     if not pending:
         print("[SEG] All masks exist. Skipping."); return
 
-    w = _resolve_seg_workers(workers)
-    if w <= 1:
-        import torch as _torch, cv2 as _cv2, os as _os
-        try: _cv2.setNumThreads(0)
-        except Exception: pass
-        th = max(1, (_os.cpu_count() or 1) - 2)
-        _torch.set_num_threads(th)
-        print(f"[SEG] single-process | torch threads={th} | batch={batch_size} | in={input_size}")
-        model, device = abd_load_torch_unet(abd_model_path, device="cpu")
-        paths = pending
-        for i in range(0, len(paths), batch_size):
-            chunk = paths[i:i + batch_size]
-            preds = _predict_chunk(chunk, input_size, thr, model, device, return_probs=save_probs)
+    # Choose device
+    have_cuda = torch.cuda.is_available()
+    device = "cuda" if (use_gpu and have_cuda) else "cpu"
+    use_amp = (device == "cuda")
+
+    # --- GPU path: single-process, batched, mixed precision ---
+    if device == "cuda":
+        try:
+            import cv2 as _cv2
+            _cv2.setNumThreads(0)
+        except Exception:
+            pass
+        torch.set_num_threads(1)
+        print(f"[SEG] GPU mode | device=cuda | batch={batch_size} | in={input_size} | save_probs={save_probs}")
+        model, _ = abd_load_torch_unet(abd_model_path, device=device)
+        # Process sequential batches on the GPU
+        for i in range(0, len(pending), batch_size):
+            chunk = pending[i:i + batch_size]
+            preds = _predict_chunk(chunk, input_size, thr, model, device, return_probs=save_probs, use_amp=use_amp)
             for item in preds:
                 if save_probs: p, m, prob = item
                 else:          p, m = item
@@ -308,11 +346,37 @@ def run_segmentation_abd(
                 if save_probs and probs_dir:
                     stem = os.path.splitext(os.path.basename(p))[0]
                     np.save(os.path.join(probs_dir, f"{stem}.npy"), prob.astype(np.float32))
-            print(f"[SEG] {min(i + batch_size, len(paths))}/{len(paths)}")
+            print(f"[SEG][GPU] {min(i + batch_size, len(pending))}/{len(pending)}")
         return
 
+    # --- CPU path: can use multi-processing workers ---
+    w = max(1, int(workers)) if workers is not None else max(1, (os.cpu_count() or 1) - 2)
+    if w <= 1:
+        try:
+            import cv2 as _cv2
+            _cv2.setNumThreads(0)
+        except Exception:
+            pass
+        th = max(1, (os.cpu_count() or 1) - 2)
+        torch.set_num_threads(th)
+        print(f"[SEG] CPU single-process | torch threads={th} | batch={batch_size} | in={input_size}")
+        model, device = abd_load_torch_unet(abd_model_path, device="cpu")
+        for i in range(0, len(pending), batch_size):
+            chunk = pending[i:i + batch_size]
+            preds = _predict_chunk(chunk, input_size, thr, model, device, return_probs=save_probs, use_amp=False)
+            for item in preds:
+                if save_probs: p, m, prob = item
+                else:          p, m = item
+                cv2.imwrite(os.path.join(masks_dir, os.path.basename(p)), m)
+                if save_probs and probs_dir:
+                    stem = os.path.splitext(os.path.basename(p))[0]
+                    np.save(os.path.join(probs_dir, f"{stem}.npy"), prob.astype(np.float32))
+            print(f"[SEG][CPU] {min(i + batch_size, len(pending))}/{len(pending)}")
+        return
+
+    # CPU multi-process
     chunks = [pending[i:i+files_per_worker] for i in range(0, len(pending), files_per_worker)]
-    print(f"[SEG] {len(pending)} imgs → {len(chunks)} chunks | workers={w} | per-worker batch={batch_size} | in={input_size}")
+    print(f"[SEG] CPU multi-proc | {len(pending)} imgs → {len(chunks)} chunks | workers={w} | per-worker batch={batch_size} | in={input_size}")
     done = 0
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=w,
@@ -328,12 +392,6 @@ def run_segmentation_abd(
 
 # ------------------------------ STRICT CRF ------------------------------
 def _refine_with_crf(img_bgr: np.ndarray, prob01: np.ndarray, iters: int = CRF_ITERS) -> np.ndarray:
-    try:
-        import pydensecrf.densecrf as dcrf
-        from pydensecrf.utils import unary_from_softmax
-    except Exception:
-        return (prob01 > 0.5).astype(np.uint8) * 255
-
     H, W = prob01.shape
     CRF_MAX_PIXELS = 1_800_000
     scale = 1.0
@@ -386,17 +444,12 @@ def _erode_mask_border(mask: np.ndarray, frac: float) -> np.ndarray:
     r = max(1, int(round(frac * min(h, w))))
     r = min(r, 64)  # safety cap
 
-    # binarize just in case (handle soft masks)
     bin_mask = (mask > 0).astype(np.uint8) * 255
-
-    # pad so erosion also trims boundary-adjacent mask
     pad = r
     bin_pad = cv2.copyMakeBorder(bin_mask, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
 
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     eroded = cv2.erode(bin_pad, k, iterations=1)
-
-    # unpad back to original size
     eroded = eroded[pad:-pad, pad:-pad]
     return eroded
 
@@ -463,7 +516,7 @@ def _postprocess_file(fname: str, input_dir: str, output_dir: str, k_unused: int
 
     # ---- Light cleanup on the final mask (edge erode + tiny CC removal) ----
     mask = _remove_small_components(mask, SMALL_COMP_FRAC)  # drop tiny CCs first
-    mask = _erode_mask_border(mask, EDGE_ERODE_FRAC)  # shave the mask edge
+    mask = _erode_mask_border(mask, EDGE_ERODE_FRAC)        # shave the mask edge
 
     # ---- Save masked composite ----
     comp = cv2.bitwise_and(orig, orig, mask=mask)
@@ -542,7 +595,7 @@ def run_postprocessing(
         if not all(os.path.exists(p) for p in outs):
             pending.append(f)
 
-    # Resolve workers (same policy you asked for elsewhere)
+    # Resolve workers (same policy as elsewhere)
     cpu = os.cpu_count() or 1
     cap = max(1, cpu - 2)
     w = cap if workers is None else min(max(int(workers), 1), cap)
@@ -552,10 +605,17 @@ def run_postprocessing(
     results: List[Tuple[str, Optional[float], bool, float]] = []
     if pending:
         if w <= 1:
+            try:
+                cv2.setNumThreads(0)
+            except Exception:
+                pass
             for f in pending:
                 results.append(_postprocess_file(f, input_dir, output_dir, k))
         else:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=w) as exe:
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=w,
+                    initializer=_init_post_worker,  # <— add this
+            ) as exe:
                 futs = [exe.submit(_postprocess_file, f, input_dir, output_dir, k) for f in pending]
                 for fut in concurrent.futures.as_completed(futs):
                     results.append(fut.result())
@@ -626,7 +686,8 @@ def classify_skin(
     seg_workers: Optional[int] = None,
     post_workers: Optional[int] = None,
     workers: Optional[int] = None,
-    use_crf: bool = USE_CRF_DEFAULT
+    use_crf: bool = USE_CRF_DEFAULT,
+    use_gpu: bool = True,   # <— NEW: pass from main.py
 ) -> None:
     for sub in ['masks','masked','clusters','rep_color'] + (['probs'] if use_crf else []):
         os.makedirs(os.path.join(output_dir, sub), exist_ok=True)
@@ -665,7 +726,8 @@ def classify_skin(
         files_per_worker=256,
         save_probs=use_crf,
         probs_dir=os.path.join(output_dir, 'probs') if use_crf else None,
-        prob_format="npy"
+        prob_format="npy",
+        use_gpu=use_gpu,  # <— NEW
     )
 
     run_postprocessing(

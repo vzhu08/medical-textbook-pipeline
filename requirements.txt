@@ -1,20 +1,14 @@
 # requirements.txt
 
-Pillow
 numpy
 opencv-python
-torch
 transformers
-paddlepaddle
-paddleocr
-layoutparser
 PyMuPDF
 spacy
 nltk
-scikit-learn
-scikit-image
-tensorflow
-keras
 matplotlib
-tqdm
+setuptools
+paddlepaddle
+paddleocr
+cython
 pydensecrf
