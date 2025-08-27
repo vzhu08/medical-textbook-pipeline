@@ -2,8 +2,16 @@
 """
 Image-first pipeline (photograph candidate finder) with unified text extraction.
 
-This version isolates OCR fallback into a separate helper process (ocr_struct_helper.py)
-to avoid Torch↔Paddle CUDA DLL conflicts on Windows. No Paddle imports occur here.
+Key behavior:
+  • Render all page JPEGs.
+  • WHOLE-PDF text extraction:
+        - If PyMuPDF finds ANY spans across the doc → use PyMuPDF for ALL pages.
+        - Else → run OCR in a separate helper process for ALL pages.
+  • Then: whitebox text → find figure/photograph boxes → save crops + debug masks.
+
+Isolation:
+  • No Paddle imports here. OCR is delegated to ocr_struct_helper.py (separate process),
+    so Torch and Paddle never share a process (avoids DLL conflicts).
 
 Outputs:
   output/
@@ -23,12 +31,12 @@ import os
 import sys
 import json
 import argparse
+from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Any
 import statistics
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import subprocess
-from pathlib import Path
 
 import fitz  # PyMuPDF
 import cv2
@@ -116,16 +124,6 @@ def find_bounding_boxes(
     """
     Given a "whiteboxed" page image (text painted white), find non-text blocks likely
     to be photographs / figures using adaptive threshold + morphology + CC.
-
-    Steps:
-      1) (optional) downscale to 'detect_scale' for speed.
-      2) grayscale -> adaptiveThreshold (binary INV): dark blobs=1.
-      3) morphological close to fill tiny holes; optional dilate bridge.
-      4) connectedComponentsWithStats -> stats → boxes
-      5) filter by absolute area, relative area, box size, and aspect ratio
-      6) rescale to original if downscaled; dedupe overlaps.
-
-    Returns: list of (x, y, w, h) in original image coordinates.
     """
     assert img is not None and img.ndim == 3, "expects BGR page image"
 
@@ -225,7 +223,7 @@ def find_bounding_boxes(
     return final_boxes
 
 # ----------------------------------------------------------------------------
-# UNIFIED TEXT-STRUCTURE HELPERS (new)
+# UNIFIED TEXT-STRUCTURE HELPERS
 # ----------------------------------------------------------------------------
 def _xyxy_to_xywh(x0: float, y0: float, x1: float, y1: float) -> List[int]:
     x = int(round(min(x0, x1)))
@@ -418,8 +416,7 @@ def extract_struct_pymupdf(pdf_path: str) -> Dict[str, Dict[str, Any]]:
 def render_pages(pdf_path: str, out_dir: str) -> Dict[str, Dict[str, float]]:
     """
     Render each page at RENDER_DPI, then (if needed) downscale so the longest side is MAX_LONG_SIDE.
-    Save as JPEG. Returns a map {page_key: {'w': int, 'h': int, 'scale': float}}, where 'scale'
-    is the downscale factor applied to the 300-DPI pixel dimensions.
+    Save as JPEG. Returns a map {page_key: {'w': int, 'h': int, 'scale': float}}.
     """
     os.makedirs(out_dir, exist_ok=True)
     doc = fitz.open(pdf_path)
@@ -447,43 +444,125 @@ def render_pages(pdf_path: str, out_dir: str) -> Dict[str, Dict[str, float]]:
     return page_info
 
 # ----------------------------------------------------------------------------
-# OCR HELPER RUNNER (subprocess)
+# OCR HELPER RUNNER (subprocess) — GPU OK (separate process)
 # ----------------------------------------------------------------------------
-def _run_ocr_helper(pages_dir: str, page_keys: List[str], work_dir: str, device: str = "cpu", save_debug: bool = True) -> Dict[str, Dict[str, Any]]:
+def _run_ocr_helper(pages_dir: str, page_keys: List[str], work_dir: str, device: str = "gpu", save_debug: bool = True) -> Dict[str, Dict[str, Any]]:
     """
-    Launch ocr_struct_helper.py as a separate process so PaddleOCR loads
-    in a different process (no Torch/Paddle DLL conflict).
+    Run ocr_struct_helper.py in a separate process. Always writes an output JSON
+    (helper also guarantees this). Uses absolute paths and never crashes caller.
     """
     if not page_keys:
         return {}
 
-    # write page list file
-    os.makedirs(work_dir, exist_ok=True)
-    pages_file = os.path.join(work_dir, "need_ocr_pages.txt")
+    # Absolutes + dirs
+    work_dir_abs  = os.path.abspath(work_dir)
+    pages_dir_abs = os.path.abspath(pages_dir)
+    os.makedirs(work_dir_abs, exist_ok=True)
+
+    pages_file = os.path.join(work_dir_abs, "need_ocr_pages.txt")
     with open(pages_file, "w", encoding="utf-8") as f:
         f.write("\n".join(page_keys))
 
-    out_json = os.path.join(work_dir, "ocr_struct.json")
-    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    out_json = os.path.join(work_dir_abs, "ocr_struct.json")
+    out_json_abs = os.path.abspath(out_json)
+    os.makedirs(os.path.dirname(out_json_abs), exist_ok=True)
 
+    # Helper path (same folder as this file)
     helper_path = Path(__file__).with_name("ocr_struct_helper.py")
+    helper_abs  = os.path.abspath(str(helper_path))
+
     cmd = [
         sys.executable,
-        str(helper_path),
-        "--pages-dir", pages_dir,
+        helper_abs,
+        "--pages-dir", pages_dir_abs,
         "--pages-file", pages_file,
-        "--out-json", out_json,
-        "--device", device,
+        "--out-json", out_json_abs,
+        "--device", device,  # "gpu" is fine here; it's isolated
     ]
     if save_debug:
         cmd.append("--save-debug")
 
     print("[OCR-HELPER] Launching:", " ".join(cmd))
-    # If the helper crashes, raise so you notice
-    subprocess.run(cmd, check=True)
+    # Let it run; do not raise even if it returns non-zero. Helper will still write something.
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.stdout:
+        print(proc.stdout.strip())
+    if proc.stderr:
+        print(proc.stderr.strip())
 
-    with open(out_json, "r", encoding="utf-8") as f:
-        return json.load(f)
+    # Guarantee the file exists so we don't crash
+    if not os.path.exists(out_json_abs):
+        print(f"[OCR-HELPER] No output at {out_json_abs}. Creating empty JSON and continuing.")
+        with open(out_json_abs, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+    with open(out_json_abs, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return {}
+
+# ----------------------------------------------------------------------------
+# WHOLE-PDF text selection (PyMuPDF OR OCR for ALL pages)
+# ----------------------------------------------------------------------------
+def _build_struct_all_or_nothing(
+    pdf_path: str,
+    page_info: Dict[str, Dict[str, float]],
+    pages_dir: str,
+    output_dir: str,
+    device: str = "gpu",          # helper device (separate process)
+    save_debug: bool = True
+) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """
+    Whole-PDF logic:
+      - If PyMuPDF finds ANY spans across the document, use PyMuPDF for ALL pages.
+      - Else run OCR (helper) for ALL pages.
+
+    Returns: (unified_struct, engine_used) where engine_used in {"pymupdf","ocr"}.
+    """
+    # 1) Try PyMuPDF (300dpi coords), then scale to saved-JPEG coords
+    struct300 = extract_struct_pymupdf(pdf_path)
+    total_spans = sum(len(p.get("spans_flat", [])) for p in struct300.values())
+
+    if total_spans > 0:
+        # Use PyMuPDF for ALL pages
+        unified_struct: Dict[str, Dict[str, Any]] = {}
+        for page_key, pobj in struct300.items():
+            sc = float(page_info.get(page_key, {}).get('scale', 1.0))
+            pobj_scaled = _scale_page_struct(pobj, sc)
+            pobj_scaled['page_size'] = {
+                'w': page_info[page_key]['w'],
+                'h': page_info[page_key]['h'],
+                'scale': sc,
+                'dpi': RENDER_DPI
+            }
+            unified_struct[page_key] = pobj_scaled
+        print(f"[PIPELINE] PyMuPDF spans found (total={total_spans}) → using PyMuPDF for all pages")
+        return unified_struct, "pymupdf"
+
+    # 2) Else: OCR every page via helper (already isolated from torch)
+    page_keys = sorted(page_info.keys())
+    print(f"[PIPELINE] PyMuPDF found no text in the entire PDF → running OCR for {len(page_keys)} page(s)")
+    ocr_struct = _run_ocr_helper(
+        pages_dir=pages_dir,
+        page_keys=page_keys,
+        work_dir=os.path.join(output_dir, "ocr_helper"),
+        device=device,
+        save_debug=save_debug,
+    )
+
+    if not ocr_struct:
+        # Produce empty structs so downstream never crashes
+        print("[PIPELINE] WARN: OCR helper returned no results; continuing with empty text.")
+        empty = {
+            'page_size': {
+                'w': 0, 'h': 0, 'scale': 1.0, 'dpi': RENDER_DPI
+            },
+            'blocks': [], 'lines_flat': [], 'spans_flat': [], 'entries': []
+        }
+        ocr_struct = {pk: empty for pk in page_keys}
+
+    return ocr_struct, "ocr"
 
 # ----------------------------------------------------------------------------
 # CROP WORKER (whitebox text → CC mask → candidate crops)
@@ -570,42 +649,15 @@ def extract_images_pipeline(pdf_path: str, output_dir: str, workers: int = None)
     # 1) render pages (JPEG @ 300dpi, capped at MAX_LONG_SIDE)
     page_info = render_pages(pdf_path, dirs["pages"])  # contains per-page downscale 'scale'
 
-    # 2) Build unified structured text (PyMuPDF at 300dpi coords)
-    struct300 = extract_struct_pymupdf(pdf_path)  # rich structure at pre-downscale coords
-
-    # Downscale structured pages to match saved JPEG coords (using page_info['scale'])
-    unified_struct: Dict[str, Dict[str, Any]] = {}
-    for page_key, pobj in struct300.items():
-        sc = float(page_info.get(page_key, {}).get('scale', 1.0))
-        pobj_scaled = _scale_page_struct(pobj, sc)
-        # Replace page_size with actual saved JPEG size
-        pobj_scaled['page_size'] = {
-            'w': page_info[page_key]['w'], 'h': page_info[page_key]['h'], 'scale': sc, 'dpi': RENDER_DPI
-        }
-        unified_struct[page_key] = pobj_scaled
-
-    # If a page has zero spans after PyMuPDF, fill it via OCR with the same structure (helper subprocess)
-    need_ocr = [pk for pk, pobj in unified_struct.items() if len(pobj.get('spans_flat', [])) == 0]
-    if need_ocr:
-        print(f"[PIPELINE] {len(need_ocr)} page(s) had no text via PyMuPDF → running OCR struct fallback (external helper)")
-        try:
-            # device="cpu" avoids any CUDA dependency in the helper
-            ocr_struct = _run_ocr_helper(
-                pages_dir=dirs['pages'],
-                page_keys=need_ocr,
-                work_dir=os.path.join(output_dir, "ocr_helper"),
-                device="gpu",
-                save_debug=True
-            )
-            for pk in need_ocr:
-                if pk in ocr_struct:
-                    unified_struct[pk] = ocr_struct[pk]
-                else:
-                    print(f"[PIPELINE] warn: no OCR result for {pk}, leaving as-is")
-        except subprocess.CalledProcessError as e:
-            print(f"[PIPELINE] ERROR running OCR helper: {e}\nSkipping OCR fallback.")
-    else:
-        print("[PIPELINE] PyMuPDF found text on all pages; OCR struct fallback not needed")
+    # 2) WHOLE-PDF text: use PyMuPDF if ANY spans exist; otherwise OCR ALL pages
+    unified_struct, engine_used = _build_struct_all_or_nothing(
+        pdf_path=pdf_path,
+        page_info=page_info,
+        pages_dir=dirs['pages'],
+        output_dir=output_dir,
+        device="gpu",          # GPU is fine — helper is a separate process
+        save_debug=True
+    )
 
     # Save per-page rich structure + master file
     for pk, pobj in unified_struct.items():
@@ -617,7 +669,7 @@ def extract_images_pipeline(pdf_path: str, output_dir: str, workers: int = None)
     # Derive legacy flat entries (rect,text) from the structured pages (keeps downstream identical)
     text_data: Dict[str, List[Dict]] = {pk: pobj.get('entries', []) for pk, pobj in unified_struct.items()}
 
-    # 2b) Write per-page entries JSON (unchanged legacy dir)
+    # 2b) Write per-page entries JSON (legacy)
     for page_key, entries in text_data.items():
         with open(os.path.join(dirs['entries_pages'], f"{page_key}.json"), 'w', encoding='utf-8') as f:
             json.dump(entries, f, indent=2)

@@ -4,17 +4,21 @@ ocr_struct_helper.py
 
 Runs PaddleOCR in a separate process to build the SAME rich text structure
 (blocks → paragraphs → lines → spans) for specific pages. This isolates
-Paddle from any Torch imports in the main process (prevents CUDA DLL conflicts).
+Paddle from any Torch imports in the main process.
+
+Behavior guarantees:
+  • Always writes --out-json (even `{}` on failure) so caller never crashes.
+  • Accepts --device {cpu,gpu}. Using GPU here is safe (separate process).
 
 Usage:
   python ocr_struct_helper.py \
     --pages-dir /path/to/output/page_images \
     --pages-file /path/to/need_ocr_pages.txt \
     --out-json /path/to/ocr_struct.json \
-    --device cpu \
+    --device gpu \
     [--save-debug]
 
-The helper writes:
+Writes:
   - out-json: JSON mapping { "pageNNN": {page_size, blocks, lines_flat, spans_flat, entries}, ... }
   - (optional) debug overlays in <pages-dir>/../ocr_images
   - (optional) raw OCR JSON in <pages-dir>/../ocr_json
@@ -24,7 +28,7 @@ import os
 import sys
 import json
 import argparse
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 import statistics
 
 # keep threads light
@@ -37,7 +41,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-# constants (should mirror main)
 RENDER_DPI = 300
 
 # ---------------- basic utils ----------------
@@ -150,7 +153,7 @@ def _paddle_predict_any(ocr, img_bgr: np.ndarray):
         for it in itms:
             poly = it[0]; txt, sc = it[1]
             xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
-            x0,y0,x1,y1 = min(xs), min(ys), max(xs), max(ys)
+            x0,y0,x1,y1 = min(xs),min(ys),max(xs),max(ys)
             out.append(([x0, y0, x1, y1], txt, sc))
     except Exception:
         pass
@@ -202,13 +205,13 @@ def build_ocr_struct_for_pages(pages_dir: str, page_keys: List[str], device: str
         # save raw json + overlay for debug
         if save_debug:
             try:
-                dbg_data = {
+                data = {
                     'rec_boxes': [p[0] for p in preds],
                     'rec_texts': [p[1] for p in preds],
                     'rec_scores': [p[2] for p in preds],
                 }
                 with open(os.path.join(ocr_json_dir, f"{pk}.json"), 'w', encoding='utf-8') as jf:
-                    json.dump(dbg_data, jf, indent=2)
+                    json.dump(data, jf, indent=2)
                 pil_img = bgr_to_pil(img)
                 draw = ImageDraw.Draw(pil_img)
                 for (x0,y0,x1,y1), _, _ in preds:
@@ -259,3 +262,35 @@ def build_ocr_struct_for_pages(pages_dir: str, page_keys: List[str], device: str
         }
 
     return out
+
+# ---------------- CLI ----------------
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pages-dir", required=True, help="Directory containing pageNNN.jpg images.")
+    ap.add_argument("--pages-file", required=True, help="Text file with one page key per line (e.g., page001).")
+    ap.add_argument("--out-json", required=True, help="Path to write OCR struct JSON.")
+    ap.add_argument("--device", default="gpu", choices=["cpu", "gpu"], help="Paddle device to use in helper.")
+    ap.add_argument("--save-debug", action="store_true", help="Save overlays and raw OCR JSON alongside pages.")
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+    # Read page keys
+    try:
+        with open(args.pages_file, "r", encoding="utf-8") as f:
+            page_keys = [ln.strip() for ln in f if ln.strip()]
+    except Exception as e:
+        print(f"[OCR_HELPER] failed to read pages file: {e}", file=sys.stderr)
+        page_keys = []
+
+    # Run OCR; never exit without writing JSON
+    try:
+        res = build_ocr_struct_for_pages(args.pages_dir, page_keys, device=args.device, save_debug=bool(args.save_debug))
+    except Exception as e:
+        print(f"[OCR_HELPER] ERROR during OCR: {e}", file=sys.stderr)
+        res = {}
+
+    os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=2, ensure_ascii=False)
+    print(f"[OCR_HELPER] Wrote OCR struct for {len(res)} page(s) → {args.out_json}")

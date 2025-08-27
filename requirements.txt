@@ -3,12 +3,14 @@
 numpy
 opencv-python
 transformers
+torch
 PyMuPDF
 spacy
 nltk
 matplotlib
 setuptools
-paddlepaddle
-paddleocr
+paddlepaddle==3.1.0
+paddlex==3.1.0
+paddleocr==3.1.0
 cython
 pydensecrf

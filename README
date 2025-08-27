@@ -2,6 +2,8 @@ Work in progress pipeline for dermatology textbook photograph race identificatio
 
 Please import requirements.txt before using
 
+If running PaddleOCR with GPU, install all Paddle dependencies first then torch. Ensure correct CUDA wheel.
+
 Abd skin segmentation: https://github.com/MRE-Lab-UMD/abd-skin-segmentation/tree/master
 Download Models/final_unet_pytorch.pth and create /models/abd-skin-segmentation/
 
