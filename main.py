@@ -3,15 +3,14 @@
 import os
 import glob
 import time
-import platform
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline control flags
 # ──────────────────────────────────────────────────────────────────────────────
-RUN_EXTRACTION = True          # Extract images from PDF
-RUN_FILTER_PHOTO = False        # Filter images into photos vs illustrations
-RUN_FILTER_SKIN = False         # Filter photos into skin vs no_skin
-RUN_SKIN_CLASSER = False        # Identify skin tone
+RUN_EXTRACTION = False          # Extract images from PDF
+RUN_FILTER_PHOTO = True        # Filter images into photos vs illustrations
+RUN_FILTER_SKIN = True         # Filter photos into skin vs no_skin
+RUN_SKIN_CLASSER = True        # Identify skin tone
 RUN_TEXT = False               # Run text analysis
 
 WORKERS = 12

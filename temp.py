@@ -10,5 +10,5 @@ ocr = PaddleOCR(
 
 result = ocr.predict("textbook_inputs/dermatology1.pdf")
 
-result.save_to_json("data/debug")
-result.save_to_img("data/debug")
+result[0].save_to_json("data/debug")
+result[0].save_to_img("data/debug")

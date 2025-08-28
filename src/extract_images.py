@@ -6,12 +6,17 @@ Key behavior:
   • Render all page JPEGs.
   • WHOLE-PDF text extraction:
         - If PyMuPDF finds ANY spans across the doc → use PyMuPDF for ALL pages.
-        - Else → run OCR in a separate helper process for ALL pages.
+        - Else → run PaddleOCR **on the PDF path** for ALL pages (returns a list of per-page results).
   • Then: whitebox text → find figure/photograph boxes → save crops + debug masks.
 
-Isolation:
-  • No Paddle imports here. OCR is delegated to ocr_struct_helper.py (separate process),
-    so Torch and Paddle never share a process (avoids DLL conflicts).
+Notes:
+  • Paddle is now imported/used directly in-process (no helper subprocess).
+  • For Paddle-on-PDF, we parse each page result, scale its boxes to the saved page JPEG size
+    (if Paddle’s internal render size differs), and write:
+      - rich per-page structure in text_struct_pages/
+      - legacy entries (rect,text) in text_boxes_pages/
+      - combined files text_struct.json and text_boxes.json
+      - optional debug: ocr_json/pageNNN.json and ocr_images/pageNNN.jpg via save_to_json/save_to_img
 
 Outputs:
   output/
@@ -24,7 +29,8 @@ Outputs:
     text_struct_pages/      per-page rich structure (blocks → paragraphs → lines → spans)
     text_struct.json        all pages (rich structure)
     manifest.json           { pages: { pageNNN: { text: [...legacy entries...], crops: [...] } } }
-    ocr_helper/             temp files for the OCR helper (page list + returned JSON)
+    ocr_images/             (debug) Paddle overlay per page
+    ocr_json/               (debug) Paddle raw per-page JSON
 """
 
 import os
@@ -36,7 +42,6 @@ from typing import List, Tuple, Dict, Optional, Any
 import statistics
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
-import subprocess
 
 import fitz  # PyMuPDF
 import cv2
@@ -50,7 +55,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 # ---- Render / scaling config (shared across functions) ----
 RENDER_DPI = 300                     # logical DPI for coordinate math
-MAX_LONG_SIDE = 2400                 # cap saved page image's longest side
+MAX_LONG_SIDE = 5000                 # cap saved page image's longest side
 JPG_QUALITY = 95                     # default JPEG quality for all writes
 
 BBox = Tuple[int, int, int, int]     # x, y, w, h  (pixel coords in saved-page space)
@@ -59,7 +64,8 @@ BBox = Tuple[int, int, int, int]     # x, y, w, h  (pixel coords in saved-page s
 # UTILS
 # ----------------------------------------------------------------------------
 def imwrite_jpg(path: str, img_bgr: np.ndarray, quality: int = JPG_QUALITY) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True
+    )
     cv2.imwrite(path, img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
 
 def clean_boxes(boxes: List[BBox]) -> List[BBox]:
@@ -118,8 +124,8 @@ def find_bounding_boxes(
     min_area_frac: float = 0.0025,
     save_mask_dir: Optional[str] = None,
     save_mask_name: Optional[str] = None,
-    detect_scale: float = 1.0,         # e.g., 0.5 for speed; boxes will be rescaled up
-    save_mask_binary: bool = True,     # write cleaned mask as JPEG if save dirs provided
+    detect_scale: float = 1.0,
+    save_mask_binary: bool = True,
 ) -> List[Tuple[int, int, int, int]]:
     """
     Given a "whiteboxed" page image (text painted white), find non-text blocks likely
@@ -127,14 +133,9 @@ def find_bounding_boxes(
     """
     assert img is not None and img.ndim == 3, "expects BGR page image"
 
-    # 1) Downscale for detection if requested
     H, W = img.shape[:2]
     scale = max(1e-6, float(detect_scale))
-    if scale != 1.0:
-        small = cv2.resize(img, (int(W * scale), int(H * scale)), interpolation=cv2.INTER_AREA)
-    else:
-        small = img
-
+    small = img if scale == 1.0 else cv2.resize(img, (int(W * scale), int(H * scale)), interpolation=cv2.INTER_AREA)
     gray_s = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
     # 2) Adaptive threshold to isolate dark-ish blocks (invert so figures = 255)
@@ -146,18 +147,16 @@ def find_bounding_boxes(
         bs, int(C)
     )
 
-    # 3) Morph close to join near components & fill pinholes
+    # 3) Morphology
     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=1)
 
-    # Optional bridge/dilate
     if bridge_px and bridge_px > 0:
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_px, bridge_px))
         mask = cv2.dilate(mask, k, iterations=1)
 
     # 4) Connected components
     num_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
     Hs, Ws = gray_s.shape
     page_area_s = Hs * Ws
     rel_area_floor_s = max(1, int(min_area_frac * page_area_s))
@@ -175,16 +174,12 @@ def find_bounding_boxes(
         bw = int(stats[lbl, cv2.CC_STAT_WIDTH])
         bh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
 
-        # Oversize guard relative to scaled page (remove near-page-size blobs)
         if bw * bh > 0.85 * page_area_s:
             continue
-
-        # Absolute min box size (scaled)
         if bw < max(1, int(round(min_box_size[0] * scale))) or \
            bh < max(1, int(round(min_box_size[1] * scale))):
             continue
 
-        # Aspect ratio filter
         ar = bw / float(max(1, bh))
         if ar < lo_ar or ar > hi_ar:
             continue
@@ -192,35 +187,27 @@ def find_bounding_boxes(
         keep_labels.append(lbl)
         raw_boxes_scaled.append((x, y, bw, bh))
 
-    # 5) Scale boxes back up to original coordinate space if downscaled
-    if scale != 1.0:
-        raw_boxes = [
-            (int(round(x / scale)), int(round(y / scale)),
-             max(1, int(round(w / scale))), max(1, int(round(h / scale))))
-            for (x, y, w, h) in raw_boxes_scaled
-        ]
-    else:
-        raw_boxes = raw_boxes_scaled
+    # 5) Rescale boxes to full image
+    raw_boxes = [
+        (int(round(x / scale)), int(round(y / scale)),
+         max(1, int(round(w / scale))), max(1, int(round(h / scale))))
+        for (x, y, w, h) in raw_boxes_scaled
+    ] if scale != 1.0 else raw_boxes_scaled
 
-    # 6) Optionally write a cleaned binary mask JPEG (uses the labels we kept)
+    # 6) Optional debug binary mask
     if save_mask_dir and save_mask_name and save_mask_binary:
         if scale != 1.0:
             clean_small = np.zeros_like(labels, dtype=np.uint8)
-            for lbl in keep_labels:
-                clean_small[labels == lbl] = 255
+            for lbl in keep_labels: clean_small[labels == lbl] = 255
             clean_full = cv2.resize(clean_small, (W, H), interpolation=cv2.INTER_NEAREST)
         else:
             clean_full = np.zeros_like(labels, dtype=np.uint8)
-            for lbl in keep_labels:
-                clean_full[labels == lbl] = 255
-
+            for lbl in keep_labels: clean_full[labels == lbl] = 255
         mask_bgr = cv2.cvtColor(clean_full, cv2.COLOR_GRAY2BGR)
         os.makedirs(save_mask_dir, exist_ok=True)
         imwrite_jpg(os.path.join(save_mask_dir, f"{save_mask_name}.jpg"), mask_bgr, quality=95)
 
-    # Dedupe near-overlapping boxes
-    final_boxes = clean_boxes(raw_boxes)
-    return final_boxes
+    return clean_boxes(raw_boxes)
 
 # ----------------------------------------------------------------------------
 # UNIFIED TEXT-STRUCTURE HELPERS
@@ -324,17 +311,6 @@ def _scale_page_struct(page_obj: Dict[str, Any], scale: float) -> Dict[str, Any]
 # PYMU PDF TEXT EXTRACTION (rich)
 # ----------------------------------------------------------------------------
 def extract_struct_pymupdf(pdf_path: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Rich PyMuPDF extraction at 300dpi coords (PDF points × RENDER_DPI/72).
-    Output per page:
-      {
-        'page_size': {'w': px_w, 'h': px_h, 'scale': 1.0, 'dpi': RENDER_DPI},
-        'blocks': [ { block_id, type, bbox, paragraphs:[{ para_id, bbox, lines:[{ line_id, bbox, text, spans:[{ span_id, bbox, text, font, size, bold, italic, color }] }]}] } ],
-        'lines_flat': [...],
-        'spans_flat': [...],
-        'entries': [ {'rect':[x,y,w,h], 'text': str}, ... ]   # legacy
-      }
-    """
     doc = fitz.open(pdf_path)
     SCALE = RENDER_DPI / 72.0
     result: Dict[str, Dict[str, Any]] = {}
@@ -355,7 +331,6 @@ def extract_struct_pymupdf(pdf_path: str) -> Dict[str, Dict[str, Any]]:
             bb = _xyxy_to_xywh(bb_xyxy[0]*SCALE, bb_xyxy[1]*SCALE, bb_xyxy[2]*SCALE, bb_xyxy[3]*SCALE)
 
             if btype != 0:
-                # keep non-text blocks as "image"/"other" for layout modeling
                 blocks_out.append({
                     'block_id': block_id, 'type': 'image' if btype == 1 else 'other',
                     'bbox': bb, 'paragraphs': []
@@ -363,7 +338,6 @@ def extract_struct_pymupdf(pdf_path: str) -> Dict[str, Dict[str, Any]]:
                 block_id += 1
                 continue
 
-            # Text block → lines/spans
             raw_lines = []
             for ln in blk.get("lines", []):
                 lbb_xyxy = ln.get("bbox", [0, 0, 0, 0])
@@ -414,10 +388,6 @@ def extract_struct_pymupdf(pdf_path: str) -> Dict[str, Dict[str, Any]]:
 # RENDER PAGES AS IMAGES (JPEG, capped at MAX_LONG_SIDE)
 # ----------------------------------------------------------------------------
 def render_pages(pdf_path: str, out_dir: str) -> Dict[str, Dict[str, float]]:
-    """
-    Render each page at RENDER_DPI, then (if needed) downscale so the longest side is MAX_LONG_SIDE.
-    Save as JPEG. Returns a map {page_key: {'w': int, 'h': int, 'scale': float}}.
-    """
     os.makedirs(out_dir, exist_ok=True)
     doc = fitz.open(pdf_path)
     page_info: Dict[str, Dict[str, float]] = {}
@@ -426,7 +396,6 @@ def render_pages(pdf_path: str, out_dir: str) -> Dict[str, Dict[str, float]]:
         out_path = os.path.join(out_dir, f"{page_key}.jpg")
 
         pix = page.get_pixmap(dpi=RENDER_DPI, alpha=False)
-        # Convert to BGR for OpenCV save
         rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
@@ -444,63 +413,190 @@ def render_pages(pdf_path: str, out_dir: str) -> Dict[str, Dict[str, float]]:
     return page_info
 
 # ----------------------------------------------------------------------------
-# OCR HELPER RUNNER (subprocess) — GPU OK (separate process)
+# PADDLE OCR (PDF in, per-page results out) — integrated
 # ----------------------------------------------------------------------------
-def _run_ocr_helper(pages_dir: str, page_keys: List[str], work_dir: str, device: str = "gpu", save_debug: bool = True) -> Dict[str, Dict[str, Any]]:
+def _ensure_paddle(device: str):
+    # Import inside to avoid overhead when not used
+    from paddleocr import PaddleOCR
+    # keep it lean/simple; doc features off
+    return PaddleOCR(
+        device=device,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        lang='en'
+    )
+
+def _paddle_predict_pdf(ocr, pdf_path: str):
     """
-    Run ocr_struct_helper.py in a separate process. Always writes an output JSON
-    (helper also guarantees this). Uses absolute paths and never crashes caller.
+    Call Paddle's .predict on the PDF path.
+    Returns a list of 'result objects' (one per page). Each should expose:
+      - .json (or .json['res']) containing rec_boxes/rec_texts/rec_scores
+      - .img (the page image Paddle used)  [optional but common]
+      - .save_to_json(path), .save_to_img(path) for debug
     """
-    if not page_keys:
-        return {}
+    try:
+        return ocr.predict(pdf_path)
+    except Exception as e:
+        print(f"[PADDLE] ERROR: predict(pdf) failed: {e}", file=sys.stderr)
+        return []
 
-    # Absolutes + dirs
-    work_dir_abs  = os.path.abspath(work_dir)
-    pages_dir_abs = os.path.abspath(pages_dir)
-    os.makedirs(work_dir_abs, exist_ok=True)
+def _group_spans_to_lines(spans: List[Dict[str, Any]], page_w: int) -> List[List[Dict[str, Any]]]:
+    """Greedy line clustering by y-band; then left→right order."""
+    if not spans:
+        return []
+    spans = sorted(spans, key=lambda s: (s['bbox'][1], s['bbox'][0]))
+    heights = [s['bbox'][3] for s in spans]
+    med_h = _median(heights, 18)
+    lines: List[List[Dict[str, Any]]] = [[spans[0]]]
+    for sp in spans[1:]:
+        cy = sp['bbox'][1] + sp['bbox'][3]/2
+        placed = False
+        for grp in lines:
+            gy = grp[-1]['bbox'][1] + grp[-1]['bbox'][3]/2
+            if abs(cy - gy) <= 0.6 * med_h:
+                grp.append(sp); placed = True; break
+        if not placed:
+            lines.append([sp])
+    for grp in lines:
+        grp.sort(key=lambda s: s['bbox'][0])
+    return lines
 
-    pages_file = os.path.join(work_dir_abs, "need_ocr_pages.txt")
-    with open(pages_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(page_keys))
-
-    out_json = os.path.join(work_dir_abs, "ocr_struct.json")
-    out_json_abs = os.path.abspath(out_json)
-    os.makedirs(os.path.dirname(out_json_abs), exist_ok=True)
-
-    # Helper path (same folder as this file)
-    helper_path = Path(__file__).with_name("ocr_struct_helper.py")
-    helper_abs  = os.path.abspath(str(helper_path))
-
-    cmd = [
-        sys.executable,
-        helper_abs,
-        "--pages-dir", pages_dir_abs,
-        "--pages-file", pages_file,
-        "--out-json", out_json_abs,
-        "--device", device,  # "gpu" is fine here; it's isolated
-    ]
+def build_struct_via_paddle_pdf(
+    pdf_path: str,
+    page_info: Dict[str, Dict[str, float]],
+    output_dir: str,
+    device: str = "gpu",
+    save_debug: bool = True
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Run PaddleOCR directly on the PDF. Parse each page, scale bboxes to our saved JPEG size,
+    and return the unified per-page structure dict.
+    """
+    page_keys = sorted(page_info.keys())
+    root_dir = output_dir
+    ocr_img_dir = os.path.join(root_dir, 'ocr_images')
+    ocr_json_dir = os.path.join(root_dir, 'ocr_json')
     if save_debug:
-        cmd.append("--save-debug")
+        os.makedirs(ocr_img_dir, exist_ok=True)
+        os.makedirs(ocr_json_dir, exist_ok=True)
 
-    print("[OCR-HELPER] Launching:", " ".join(cmd))
-    # Let it run; do not raise even if it returns non-zero. Helper will still write something.
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.stdout:
-        print(proc.stdout.strip())
-    if proc.stderr:
-        print(proc.stderr.strip())
+    ocr = _ensure_paddle(device=device)
+    res_list = _paddle_predict_pdf(ocr, pdf_path)
 
-    # Guarantee the file exists so we don't crash
-    if not os.path.exists(out_json_abs):
-        print(f"[OCR-HELPER] No output at {out_json_abs}. Creating empty JSON and continuing.")
-        with open(out_json_abs, "w", encoding="utf-8") as f:
-            json.dump({}, f)
+    if not res_list:
+        print("[PIPELINE] WARN: Paddle returned no results; continuing with empty text.")
+        empty_page = {
+            'page_size': {'w': 0, 'h': 0, 'scale': 1.0, 'dpi': RENDER_DPI},
+            'blocks': [], 'lines_flat': [], 'spans_flat': [], 'entries': []
+        }
+        return {pk: empty_page for pk in page_keys}
 
-    with open(out_json_abs, "r", encoding="utf-8") as f:
+    # Align counts defensively
+    n = min(len(page_keys), len(res_list))
+    if len(res_list) != len(page_keys):
+        print(f"[PADDLE] Note: page count mismatch: results={len(res_list)} vs pages={len(page_keys)}; truncating to {n}")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for idx in range(n):
+        pk = page_keys[idx]
+        r = res_list[idx]
+
+        # Pull per-page JSON payload
         try:
-            return json.load(f)
+            data = r.json.get('res', r.json)
         except Exception:
-            return {}
+            data = {}
+
+        boxes = data.get('rec_boxes', []) or []
+        texts = data.get('rec_texts', []) or []
+        scores = data.get('rec_scores', []) or [None] * len(texts)
+
+        # Source img size (prefer r.img; else derive from boxes; else fallback to our target)
+        src_w = src_h = None
+        try:
+            im = getattr(r, "img", None)
+            if im is not None:
+                if isinstance(im, np.ndarray):
+                    src_h, src_w = im.shape[:2]
+                else:
+                    # PIL.Image
+                    src_w, src_h = im.size  # type: ignore
+        except Exception:
+            pass
+        if src_w is None or src_h is None:
+            try:
+                xs = [float(max(b[0], b[2])) for b in boxes]
+                ys = [float(max(b[1], b[3])) for b in boxes]
+                src_w = int(max(xs)) if xs else int(page_info[pk]['w'])
+                src_h = int(max(ys)) if ys else int(page_info[pk]['h'])
+            except Exception:
+                src_w = int(page_info[pk]['w']); src_h = int(page_info[pk]['h'])
+
+        tgt_w = int(page_info[pk]['w']); tgt_h = int(page_info[pk]['h'])
+        sx = (tgt_w / float(src_w)) if src_w else 1.0
+        sy = (tgt_h / float(src_h)) if src_h else 1.0
+
+        # Build spans (scaled to saved JPEG coords)
+        spans = []
+        span_id = 0
+        for b, t, s in zip(boxes, texts, scores):
+            try:
+                x0, y0, x1, y1 = map(float, b)
+            except Exception:
+                # Some builds may hand back [[x0,y0], [x1,y1], ...]; handle that too
+                flat = [p for p in b]  # best-effort
+                xs = [float(p[0]) for p in flat]; ys = [float(p[1]) for p in flat]
+                x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+
+            bb = _xyxy_to_xywh(x0 * sx, y0 * sy, x1 * sx, y1 * sy)
+            txt = (t or "").strip()
+            if not txt:
+                continue
+            spans.append({
+                'span_id': span_id, 'bbox': bb, 'text': txt,
+                'font': None, 'size': float(bb[3]), 'bold': None, 'italic': None, 'color': None
+            })
+            span_id += 1
+
+        # Group to lines → paragraphs → blocks
+        lines_list = []
+        for line_idx, grp in enumerate(_group_spans_to_lines(spans, tgt_w)):
+            line_text = " ".join([s['text'] for s in grp]).strip()
+            lbb = grp[0]['bbox']
+            for s in grp[1:]:
+                lbb = _union(lbb, s['bbox'])
+            lines_list.append({'line_id': line_idx, 'bbox': lbb, 'text': line_text, 'spans': grp})
+
+        tmp_lines = [{'bbox': ln['bbox'], 'text': ln['text'], 'spans': ln['spans'], 'page_w': tgt_w} for ln in lines_list]
+        paragraphs = []
+        for para_id, group in enumerate(_group_lines_into_paragraphs(tmp_lines, tgt_w)):
+            pbox = None
+            lines_out = []
+            for ln in group:
+                lines_out.append({'line_id': len(lines_out), 'bbox': ln['bbox'], 'text': ln['text'], 'spans': ln['spans']})
+                pbox = ln['bbox'] if pbox is None else _union(pbox, ln['bbox'])
+            paragraphs.append({'para_id': para_id, 'bbox': pbox or [0,0,1,1], 'lines': lines_out})
+
+        blocks = [{'block_id': 0, 'type': 'text', 'bbox': paragraphs[0]['bbox'] if paragraphs else [0,0,tgt_w,tgt_h], 'paragraphs': paragraphs}]
+        entries, lines_flat, spans_flat = _flatten_blocks(blocks)
+        out[pk] = {
+            'page_size': {'w': tgt_w, 'h': tgt_h, 'scale': 1.0, 'dpi': RENDER_DPI},
+            'blocks': blocks, 'lines_flat': lines_flat, 'spans_flat': spans_flat, 'entries': entries
+        }
+
+        # Debug artifacts from Paddle
+        if save_debug:
+            try:
+                r.save_to_json(os.path.join(ocr_json_dir, f"{pk}.json"))
+            except Exception as e:
+                print(f"[PADDLE] warn: save_to_json failed for {pk}: {e}", file=sys.stderr)
+            try:
+                r.save_to_img(os.path.join(ocr_img_dir, f"{pk}.jpg"))
+            except Exception as e:
+                print(f"[PADDLE] warn: save_to_img failed for {pk}: {e}", file=sys.stderr)
+
+    return out
 
 # ----------------------------------------------------------------------------
 # WHOLE-PDF text selection (PyMuPDF OR OCR for ALL pages)
@@ -508,15 +604,14 @@ def _run_ocr_helper(pages_dir: str, page_keys: List[str], work_dir: str, device:
 def _build_struct_all_or_nothing(
     pdf_path: str,
     page_info: Dict[str, Dict[str, float]],
-    pages_dir: str,
     output_dir: str,
-    device: str = "gpu",          # helper device (separate process)
+    device: str = "gpu",
     save_debug: bool = True
 ) -> Tuple[Dict[str, Dict[str, Any]], str]:
     """
     Whole-PDF logic:
       - If PyMuPDF finds ANY spans across the document, use PyMuPDF for ALL pages.
-      - Else run OCR (helper) for ALL pages.
+      - Else run Paddle OCR (PDF-in) for ALL pages.
 
     Returns: (unified_struct, engine_used) where engine_used in {"pymupdf","ocr"}.
     """
@@ -525,7 +620,6 @@ def _build_struct_all_or_nothing(
     total_spans = sum(len(p.get("spans_flat", [])) for p in struct300.values())
 
     if total_spans > 0:
-        # Use PyMuPDF for ALL pages
         unified_struct: Dict[str, Dict[str, Any]] = {}
         for page_key, pobj in struct300.items():
             sc = float(page_info.get(page_key, {}).get('scale', 1.0))
@@ -540,51 +634,35 @@ def _build_struct_all_or_nothing(
         print(f"[PIPELINE] PyMuPDF spans found (total={total_spans}) → using PyMuPDF for all pages")
         return unified_struct, "pymupdf"
 
-    # 2) Else: OCR every page via helper (already isolated from torch)
-    page_keys = sorted(page_info.keys())
-    print(f"[PIPELINE] PyMuPDF found no text in the entire PDF → running OCR for {len(page_keys)} page(s)")
-    ocr_struct = _run_ocr_helper(
-        pages_dir=pages_dir,
-        page_keys=page_keys,
-        work_dir=os.path.join(output_dir, "ocr_helper"),
+    # 2) Else: OCR every page via Paddle on the PDF path
+    print(f"[PIPELINE] PyMuPDF found no text → running Paddle OCR on the PDF for {len(page_info)} page(s)")
+    ocr_struct = build_struct_via_paddle_pdf(
+        pdf_path=pdf_path,
+        page_info=page_info,
+        output_dir=output_dir,
         device=device,
         save_debug=save_debug,
     )
-
-    if not ocr_struct:
-        # Produce empty structs so downstream never crashes
-        print("[PIPELINE] WARN: OCR helper returned no results; continuing with empty text.")
-        empty = {
-            'page_size': {
-                'w': 0, 'h': 0, 'scale': 1.0, 'dpi': RENDER_DPI
-            },
-            'blocks': [], 'lines_flat': [], 'spans_flat': [], 'entries': []
-        }
-        ocr_struct = {pk: empty for pk in page_keys}
-
     return ocr_struct, "ocr"
 
 # ----------------------------------------------------------------------------
 # CROP WORKER (whitebox text → CC mask → candidate crops)
 # ----------------------------------------------------------------------------
 def crop_worker(args):
-    # Ensure OpenCV single-threaded inside workers
     try:
         cv2.setNumThreads(1)
     except Exception:
         pass
 
     page_key, dirs = args
-    # Load page image
     page_img = cv2.imread(os.path.join(dirs['pages'], f"{page_key}.jpg"))
     H, W = page_img.shape[:2]
 
-    # Load pre-scaled entries written per page
     entries_path = os.path.join(dirs['entries_pages'], f"{page_key}.json")
     with open(entries_path, 'r', encoding='utf-8') as f:
         entries = json.load(f)
 
-    # 1) Whitebox text (paint rectangles over text spans)
+    # 1) Whitebox text
     masked = page_img.copy()
     for e in entries:
         x, y, w, h = e['rect']
@@ -596,17 +674,16 @@ def crop_worker(args):
             continue
         cv2.rectangle(masked, (x, y), (x + w, y + h), (255, 255, 255), -1)
 
-    # Save whiteboxed page
     imwrite_jpg(os.path.join(dirs['mask'], f"{page_key}.jpg"), masked)
 
-    # 2) Find figure boxes AND save the cleaned binary mask (inside find_bounding_boxes)
+    # 2) Find figure boxes AND save the cleaned binary mask
     final = find_bounding_boxes(
         masked,
         save_mask_dir=dirs['mask_bin'],
         save_mask_name=page_key
     )
 
-    # 3) Save crops (ensure ≥1024 on both sides, preserve aspect)
+    # 3) Save crops (≥1024 both sides)
     os.makedirs(dirs['crops'], exist_ok=True)
     crops = []
     for idx, (x, y, w, h) in enumerate(final, start=1):
@@ -633,15 +710,15 @@ def crop_worker(args):
 # ----------------------------------------------------------------------------
 # MAIN PIPELINE (image-first; unified text struct + legacy entries)
 # ----------------------------------------------------------------------------
-def extract_images_pipeline(pdf_path: str, output_dir: str, workers: int = None):
+def extract_images_pipeline(pdf_path: str, output_dir: str, workers: int = None, ocr_device: str = "gpu", save_ocr_debug: bool = True):
     # prepare dirs
     dirs = {
         'pages': os.path.join(output_dir, 'page_images'),
-        'mask': os.path.join(output_dir, 'page_masked'),       # whiteboxed pages (JPEG)
-        'mask_bin': os.path.join(output_dir, 'page_mask_bin'), # cleaned thresh masks (JPEG)
+        'mask': os.path.join(output_dir, 'page_masked'),
+        'mask_bin': os.path.join(output_dir, 'page_mask_bin'),
         'crops': os.path.join(output_dir, 'bbox_crops'),
-        'entries_pages': os.path.join(output_dir, 'text_boxes_pages'),  # legacy per-page entries JSON
-        'struct_pages': os.path.join(output_dir, 'text_struct_pages'),  # rich per-page structure
+        'entries_pages': os.path.join(output_dir, 'text_boxes_pages'),
+        'struct_pages': os.path.join(output_dir, 'text_struct_pages'),
     }
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
@@ -649,14 +726,13 @@ def extract_images_pipeline(pdf_path: str, output_dir: str, workers: int = None)
     # 1) render pages (JPEG @ 300dpi, capped at MAX_LONG_SIDE)
     page_info = render_pages(pdf_path, dirs["pages"])  # contains per-page downscale 'scale'
 
-    # 2) WHOLE-PDF text: use PyMuPDF if ANY spans exist; otherwise OCR ALL pages
+    # 2) WHOLE-PDF text: use PyMuPDF if ANY spans exist; otherwise Paddle OCR (PDF-in) for ALL pages
     unified_struct, engine_used = _build_struct_all_or_nothing(
         pdf_path=pdf_path,
         page_info=page_info,
-        pages_dir=dirs['pages'],
         output_dir=output_dir,
-        device="gpu",          # GPU is fine — helper is a separate process
-        save_debug=True
+        device=ocr_device,
+        save_debug=save_ocr_debug
     )
 
     # Save per-page rich structure + master file
@@ -666,7 +742,7 @@ def extract_images_pipeline(pdf_path: str, output_dir: str, workers: int = None)
     with open(os.path.join(output_dir, "text_struct.json"), "w", encoding="utf-8") as f:
         json.dump(unified_struct, f, indent=2, ensure_ascii=False)
 
-    # Derive legacy flat entries (rect,text) from the structured pages (keeps downstream identical)
+    # Derive legacy flat entries (rect,text) from the structured pages
     text_data: Dict[str, List[Dict]] = {pk: pobj.get('entries', []) for pk, pobj in unified_struct.items()}
 
     # 2b) Write per-page entries JSON (legacy)
@@ -682,10 +758,9 @@ def extract_images_pipeline(pdf_path: str, output_dir: str, workers: int = None)
     page_keys = sorted(text_data.keys())
     args_list = [(pk, dirs) for pk in page_keys]
 
-    # decide how many workers
     if workers is None:
         workers = max(1, multiprocessing.cpu_count() - 4)
-    print(f"[PIPELINE] Running cropping with {workers} workers")
+    print(f"[PIPELINE] Running cropping with {workers} workers (engine={engine_used})")
 
     with ProcessPoolExecutor(max_workers=workers) as ex:
         results = list(ex.map(crop_worker, args_list))
