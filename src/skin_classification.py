@@ -495,16 +495,14 @@ def _postprocess_file(fname: str, input_dir: str, output_dir: str, k_unused: int
     crf_coverage = 0.0
     prob_path = os.path.join(output_dir, 'probs', f"{stem}.npy")
     if os.path.exists(prob_path) and USE_CRF_DEFAULT:
-        try:
-            prob = np.load(prob_path).astype(np.float32)
-            if prob.shape[:2] != (H, W):
-                prob = cv2.resize(prob, (W, H), interpolation=cv2.INTER_LINEAR)
-            crf_mask = _refine_with_crf(orig, prob, iters=CRF_ITERS)
-            if crf_mask.shape[:2] != (H, W):
-                crf_mask = cv2.resize(crf_mask, (W, H), interpolation=cv2.INTER_NEAREST)
-            mask = crf_mask
-        except Exception:
-            pass
+        prob = np.load(prob_path).astype(np.float32)
+        if prob.shape[:2] != (H, W):
+            prob = cv2.resize(prob, (W, H), interpolation=cv2.INTER_LINEAR)
+        crf_mask = _refine_with_crf(orig, prob, iters=CRF_ITERS)
+        if crf_mask.shape[:2] != (H, W):
+            crf_mask = cv2.resize(crf_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+        mask = crf_mask
+
 
     crf_coverage = float(np.count_nonzero(mask) / float(H * W))
 
