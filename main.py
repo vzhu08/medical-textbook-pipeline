@@ -1,9 +1,7 @@
-# main.py (subprocess-isolated version)
+# main.py
 # -----------------------------------------------------------------------------
-# This rewrite preserves timing, flags, and functionality, but executes EACH
-# pipeline step in its OWN subprocess to avoid library/DLL conflicts (e.g.
-# PaddleOCR vs PyTorch CUDA stacks).  No affinity/priority changes; just clean
-# process boundaries per step for consistency.
+# Run each pipeline stage in its own Python process to prevent CUDA/DLL clashes
+# between PaddleOCR and PyTorch.
 # -----------------------------------------------------------------------------
 
 import os
@@ -17,14 +15,14 @@ import sys
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline control flags (unchanged)
+# Pipeline switches (toggle steps on/off)
 # ──────────────────────────────────────────────────────────────────────────────
 RUN_EXTRACTION = True           # Extract images from PDF
-RUN_FILTER_PHOTO = False         # Filter images into photos vs illustrations
-RUN_FILTER_SKIN = False          # Filter photos into skin vs no_skin
-RUN_FILTER_GENDER = False        # Filter photos into male vs female
-RUN_FILTER_RACE = False          # Filter photos into putative race
-RUN_SKIN_CLASSER = False         # Identify skin tone
+RUN_FILTER_PHOTO = False        # Filter images into photos vs illustrations
+RUN_FILTER_SKIN = False         # Filter photos into skin vs no_skin
+RUN_FILTER_GENDER = False       # Filter photos into male vs female
+RUN_FILTER_RACE = False         # Filter photos into putative race
+RUN_SKIN_CLASSER = False        # Identify skin tone
 RUN_TEXT = False                # Run text analysis
 
 WORKERS = 12
@@ -34,7 +32,7 @@ abd_model_path = "models/abd-skin-segmentation/final_unet_pytorch.pth"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers (timing banners preserved)
+# Helpers (format durations, print banners, wrap timed calls)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _fmt_secs(s: float) -> str:
@@ -62,9 +60,9 @@ def _timed_call(stage_name, fn, *args, **kwargs):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Subprocess utility: import a module and call a function(**kwargs) in a CLEAN
-# Python interpreter. We pass kwargs via a temp JSON file to avoid shell quoting
-# issues and to support complex types (lists, dicts, etc.).
+# Subprocess runner
+# Import <module_path>, call <func_name>(**kwargs) in a clean interpreter.
+# Kwargs are serialized to a temp JSON file to handle complex types safely.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run_stage_subprocess(module_path: str, func_name: str, kwargs: dict, *, env=None, cwd: str | None = None) -> None:
@@ -92,17 +90,17 @@ def _run_stage_subprocess(module_path: str, func_name: str, kwargs: dict, *, env
         """
     ).strip()
 
-    # Write kwargs to a temp file so child can read them
+    # Serialize kwargs so the child can read them
     with tempfile.TemporaryDirectory() as td:
         args_json = Path(td) / "kwargs.json"
         args_json.write_text(json.dumps(kwargs, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Compose environment: keep current, overlay any overrides
+        # Compose child environment by overlaying any overrides
         child_env = os.environ.copy()
         if env:
             child_env.update(env)
 
-        # Use the current interpreter for consistency
+        # Use the same interpreter as the parent (respects venv)
         cmd = [sys.executable, "-c", bootstrap, str(args_json)]
         proc = subprocess.run(cmd, env=child_env, cwd=cwd or os.getcwd())
         if proc.returncode != 0:
@@ -112,16 +110,16 @@ def _run_stage_subprocess(module_path: str, func_name: str, kwargs: dict, *, env
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per‑PDF processing (subprocess calls for each step)
+# Per-PDF processing (each step invoked via a subprocess)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def process_pdf(pdf_path: str):
     _banner(f"Processing PDF: {os.path.basename(pdf_path)}")
 
-    # Derive base name (without extension) for this textbook
+    # Base name (no extension) for this textbook
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
 
-    # Create a separate data directory for each textbook
+    # Output layout for this textbook
     base_dir = os.path.join("data", base_name)
     extracted_dir = os.path.join(base_dir, "extracted_images")
     sorted_dir = os.path.join(base_dir, "sorted_images")
@@ -146,10 +144,10 @@ def process_pdf(pdf_path: str):
     ):
         os.makedirs(d, exist_ok=True)
 
-    # Stage timings (per PDF)
+    # Timings per step for this PDF
     stage_times: dict[str, float] = {}
 
-    # Step 1: Extract all images from the PDF (subprocess)
+    # Step 1: extract all images from the PDF
     if RUN_EXTRACTION:
         def _extract():
             _run_stage_subprocess(
@@ -161,7 +159,7 @@ def process_pdf(pdf_path: str):
                     "workers": WORKERS,
                     "save_mode": "final"
                 },
-                # env: leave default — we aren't changing device here
+                # env: default
             )
         _, dt = _timed_call("1/7 Extract Images", _extract)
         stage_times["extract"] = dt
@@ -169,7 +167,7 @@ def process_pdf(pdf_path: str):
         print("[1/7 Extract Images] skipped (flag off)")
         stage_times["extract"] = 0.0
 
-    # Step 2: First-level CLIP filtering (photos vs illustrations) (subprocess)
+    # Step 2: CLIP filter — photos vs illustrations
     if RUN_FILTER_PHOTO:
         photo_labels = [
             "a photograph",
@@ -212,7 +210,7 @@ def process_pdf(pdf_path: str):
         print("[2/7 CLIP Filter: photo vs illustration] skipped (flag off)")
         stage_times["clip_photo"] = 0.0
 
-    # Step 3: Second-level CLIP filtering (skin vs no_skin) (subprocess)
+    # Step 3: CLIP filter — skin vs no_skin
     if RUN_FILTER_SKIN:
         skin_labels = [
             "a human",
@@ -272,7 +270,7 @@ def process_pdf(pdf_path: str):
         print("[3/7 CLIP Filter: skin vs no_skin] skipped (flag off)")
         stage_times["clip_skin"] = 0.0
 
-    # Step 4: Third-level CLIP filtering (male vs female) (subprocess)
+    # Step 4: CLIP filter — male vs female
     if RUN_FILTER_GENDER:
         male_labels = [
             "a biological male",
@@ -317,7 +315,7 @@ def process_pdf(pdf_path: str):
         print("[4/7 CLIP Filter: male vs female] skipped (flag off)")
         stage_times["_clip_gender"] = 0.0
 
-    # Step 4: Fourth-level CLIP filtering (putative race) (subprocess)
+    # Step 5: CLIP filter — putative race
     if RUN_FILTER_RACE:
         black_labels = [
             "a black person",
@@ -373,7 +371,7 @@ def process_pdf(pdf_path: str):
         print("[5/7 CLIP Filter: putative race] skipped (flag off)")
         stage_times["_clip_race"] = 0.0
 
-    # Step 6: Skin tone classification (subprocess)
+    # Step 6: skin tone classification
     if RUN_SKIN_CLASSER:
         def _skin_class():
             _run_stage_subprocess(
@@ -393,7 +391,7 @@ def process_pdf(pdf_path: str):
         print("[6/7 Skin Classification] skipped (flag off)")
         stage_times["skin_class"] = 0.0
 
-    # Step 7: Text analysis (optional) (subprocess)
+    # Step 7: optional text analysis
     if RUN_TEXT:
         def _text():
             _run_stage_subprocess(
@@ -410,7 +408,7 @@ def process_pdf(pdf_path: str):
         print("[7/7 Text Analysis] skipped (flag off)")
         stage_times["text"] = 0.0
 
-    # Summary for this PDF
+    # Per-PDF summary
     total = sum(stage_times.values())
     _banner(f"Finished '{base_name}' in {_fmt_secs(total)}")
     print("Stage breakdown:")
@@ -420,11 +418,11 @@ def process_pdf(pdf_path: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entry point (unchanged behavior)
+# Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Find all PDF files in the input folder
+    # Find all PDFs under textbook_inputs/
     input_pattern = os.path.join("textbook_inputs", "*.pdf")
     all_pdfs = sorted(glob.glob(input_pattern))
 

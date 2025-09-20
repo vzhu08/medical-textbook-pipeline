@@ -1,27 +1,53 @@
 #!/usr/bin/env python3
 """
-ABD skin segmentation (PyTorch UNet) + STRICT CRF + HSV fallback + light cleanup
-GPU-aware: set use_gpu=True (and CUDA available) to run single-process batched
-inference on GPU with mixed precision. Fallbacks to CPU otherwise.
+skin_classification.py
 
-Pipeline:
-  1) Segment with UNet → per-pixel probabilities (saved if CRF is on)
-  2) Strict, edge-respecting DenseCRF on the prob map → CRF mask
-  3) If CRF mask covers <10% of the image, fallback to HSV skin mask
-  4) On the final mask (CRF or fallback):
-       - edge cleanup (remove 1% border ring)
-       - remove tiny components <1% of the image area
-  5) Save masked composites and representative color
+Purpose
+-------
+Segment skin regions in images with a PyTorch UNet, refine masks with a strict,
+edge-preserving DenseCRF, fall back to a simple HSV mask when coverage is too
+small, then compute a representative skin tint. GPU is optional.
 
-Outputs:
-    <output>/masks/<file>            raw threshold masks (0/255)
-    <output>/masked/<file>           original × final mask composites
-    <output>/probs/<stem>.npy        float32 prob maps (if CRF enabled)
-    <output>/clusters/<stem>_*       KMeans centers/counts + swatch
-    <output>/rep_color/<stem>_*      representative color chip
-    <output>/skin_tones.csv          filename, L* tint (0–100)
-    <output>/fallbacks.csv           filename, crf_coverage (0–1) for HSV fallbacks
+Flow
+----
+1) run_segmentation_abd:
+   - Load UNet checkpoint.
+   - Predict per-pixel probabilities and threshold to masks.
+   - GPU path: single process, batched, mixed precision.
+   - CPU path: single or multi-process. Option to save prob maps.
+2) run_postprocessing:
+   - If prob map exists and CRF is enabled, refine with DenseCRF.
+   - If refined mask covers < FALLBACK_MIN_COVERAGE_FRAC, use HSV fallback.
+   - Cleanup: drop tiny components and shave mask border.
+   - Save masked composites, KMeans clusters, and representative color.
+   - Update skin_tones.csv and fallbacks.csv (merged with existing rows).
+3) classify_skin:
+   - Orchestrate segmentation + postprocessing with worker resolution.
+
+Outputs
+-------
+<output>/masks/<file>            : raw threshold masks (0/255)
+<output>/masked/<file>           : original × final mask composites
+<output>/probs/<stem>.npy        : float32 prob maps (if CRF enabled)
+<output>/clusters/<stem>_*       : KMeans centers/counts + swatch
+<output>/rep_color/<stem>_*      : representative color chip
+<output>/skin_tones.csv          : filename, L* tint (0–100)
+<output>/fallbacks.csv           : filename, crf_coverage (0–1) for HSV fallbacks
+
+Access points
+----------
+- classify_skin(input_dir, output_dir, abd_model_path, ...)
+- run_segmentation_abd(input_dir, masks_dir, abd_model_path, ...)
+- run_postprocessing(input_dir, output_dir, ...)
+
+Notes
+-----
+- Mixed precision (torch.amp.autocast) is used only on CUDA.
+- DenseCRF settings favor edge adherence with gentle smoothing.
+- Workers disable OpenCV inner threads; BLAS threads are pinned low.
+- KMeans uses n_init='auto' when available, else falls back to n_init=10.
 """
+
 import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -81,14 +107,14 @@ HSV1_HI = (25, 180, 255)
 HSV2_LO = (160, 30,  60)
 HSV2_HI = (179, 180, 255)
 
-# --- helper: torch API for CUDA ---
+# --- helper: torch AMP context ---
 def _amp_autocast(device: str, enabled: bool):
-    # Use the new torch.amp.autocast on CUDA; no-op elsewhere
+    # Use torch.amp.autocast on CUDA; no-op elsewhere.
     if enabled and device.startswith("cuda"):
         return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
 
-# --- helper: ensures each post-processing worker doesn't spawn OpenCV inner threads ---
+# --- helper: post-processing worker init (no inner OpenCV threads) ---
 def _init_post_worker():
     try:
         import cv2
@@ -612,7 +638,7 @@ def run_postprocessing(
         else:
             with concurrent.futures.ProcessPoolExecutor(
                     max_workers=w,
-                    initializer=_init_post_worker,  # <— add this
+                    initializer=_init_post_worker,  # ensure no OpenCV inner threads
             ) as exe:
                 futs = [exe.submit(_postprocess_file, f, input_dir, output_dir, k) for f in pending]
                 for fut in concurrent.futures.as_completed(futs):

@@ -3,3 +3,7 @@
 /models/
 /textbook_inputs/
 /textbook_storage/
+/.idea/
+/.venv/
+/temp.py
+/test.py

@@ -2,16 +2,57 @@
 """
 image_extraction.py
 
-What changed (per your request):
-- Whiteboxing now uses the **final compiled OCR file** (paddle_compiled.json).
-  We read per-page items -> bbox_xyxy, convert to xywh, and whitebox those regions.
-  If the compiled file is missing or a page has no items, we fall back to any
-  existing text_boxes_pages/<page>.json (legacy entries) exactly as before.
+Purpose
+-------
+Extract figure regions from a textbook PDF's rendered pages and save crops. Use
+compiled OCR boxes for text whiteboxing to avoid masking figures, then detect
+figure boxes via connected components on an adaptive-mean mask.
 
-Other notes (unchanged):
-- Save-mode is strictly {all | final}.
-- Mask image saved is the raw adaptive-mean mask (upsampled to page size if we detected at reduced scale).
-- Speedups: downscale for mask/detect (1600 long side), vectorized whiteboxing, CC-with-stats, merge-only morphology.
+Flow
+----
+1) Ensure text JSONs exist:
+   - If out_dir/text_struct.json and out_dir/text_boxes.json exist, reuse them.
+   - Else call te.run_text_extraction(...) to produce text structure.
+2) Load compiled OCR rectangles:
+   - Prefer out_dir/paddle_compiled.json (xyxy → xywh per page).
+   - If missing for a page, fall back to legacy out_dir/text_boxes_pages/pageNNN.json.
+3) Prepare output folders:
+   - page_images/, page_masked/, page_mask/, page_bbox_overlay/, bbox_crops/,
+     text_boxes_pages/, bbox_pages/
+4) For each page (threaded):
+   a) Load page image
+   b) Whitebox text regions (from compiled rectangles) with fast NumPy slicing
+   c) Downscale to MASK_DET_LIMIT_SIDE for speed
+   d) Build mask with adaptive mean (binary INV) and one small dilation
+   e) Connected components with gates and de-dup to get boxes
+   f) Scale boxes back to original space and save per-page JSON
+   g) Save overlay (only in save_mode="all") and write crops (always)
+   h) Record timings
+5) Save:
+   - out_dir/bboxes.json         : {page_key: [[x,y,w,h], ...]}
+   - out_dir/manifest.json       : per-page timings, crop manifest, averages
+
+Outputs
+-------
+- bbox_crops/         : cropped figures (optionally upscaled to min side)
+- page_bbox_overlay/  : drawn boxes on page (save_mode="all" only)
+- page_mask/          : raw adaptive mask images (save_mode="all" only)
+- page_masked/        : whiteboxed pages (save_mode="all" only)
+- bbox_pages/         : per-page boxes JSON as [{'rect':[x,y,w,h]}, ...]
+- bboxes.json         : combined boxes across pages
+- manifest.json       : crops, timings, counts
+
+Public API
+----------
+    run_image_extraction(pdf_path, out_dir, device='gpu', workers=None, save_mode='final') -> None
+
+Notes
+-----
+- Whiteboxing prefers paddle_compiled.json; legacy per-page entries are a fallback.
+- Adaptive threshold is inverted so figures are white for CC detection.
+- Crops are upscaled so the shorter side is at least CROP_MIN_SIDE.
+- CPU BLAS threads are pinned to 1; OpenCV threads disabled.
+- save_mode='final' writes only crops and JSONs; 'all' also writes masks/overlays.
 """
 
 import os
@@ -25,7 +66,7 @@ import numpy as np
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Local import (same folder)
+# Project import
 import src.text_extraction as te
 
 # ---------------- Global perf/threading limits ----------------
@@ -63,7 +104,7 @@ def ensure_jpg(path: str, img_bgr: np.ndarray, quality: int = JPG_QUALITY) -> No
 
 
 def whitebox_text(page_img: np.ndarray, entries: List[Dict[str, Any]]) -> np.ndarray:
-    """Fast text whiteboxing using NumPy slicing (fewer Python→C calls)."""
+    """Whitebox rectangular text regions using fast array slicing."""
     H, W = page_img.shape[:2]
     out = page_img.copy()
     for e in entries:
@@ -79,7 +120,7 @@ def whitebox_text(page_img: np.ndarray, entries: List[Dict[str, Any]]) -> np.nda
 
 
 def adaptive_mean_mask(img_bgr: np.ndarray, block_size: int = 15, C: int = 2) -> np.ndarray:
-    """Adaptive-mean thresholding to get figures=white (255), then *merge-only* morphology."""
+    """Adaptive-mean → invert (figures=white) → one small dilation to merge fragments."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     thr  = cv2.adaptiveThreshold(
@@ -89,10 +130,10 @@ def adaptive_mean_mask(img_bgr: np.ndarray, block_size: int = 15, C: int = 2) ->
         block_size,
         C,
     )
-    # invert so figures are white for CC-based logic
+    # figures white for CC
     mask = thr
 
-    # Merge-only morphology: one small dilation pass (no open/close/erode)
+    # Merge-only morphology
     kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     merged = cv2.dilate(mask, kernel3, iterations=1)
     return merged
@@ -103,7 +144,7 @@ def adaptive_mean_mask(img_bgr: np.ndarray, block_size: int = 15, C: int = 2) ->
 # ---------------------------
 
 def clean_boxes(boxes: List[Tuple[int,int,int,int]]) -> List[Tuple[int,int,int,int]]:
-    """Remove near-duplicate boxes based on heavy overlap (≥90%)."""
+    """Drop near-duplicates if IoU with an already-kept box ≥90%."""
     final: List[Tuple[int,int,int,int]] = []
     for x, y, w, h in boxes:
         new_area = max(1, w * h)
@@ -126,7 +167,7 @@ def detect_bboxes_from_mask(mask: np.ndarray,
                             morph_kernel: Tuple[int, int] = (5, 5),
                             morph_iterations: int = 1,
                             max_page_frac: float = 0.5) -> List[Tuple[int,int,int,int]]:
-    """Connected-components on binary mask -> bounding boxes with thresholds."""
+    """Connected-components on mask → boxes filtered by size, area%, and aspect ratio."""
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
 
@@ -164,7 +205,7 @@ def detect_bboxes_from_mask(mask: np.ndarray,
 
 
 def save_crops(page_img: np.ndarray, boxes: List[Tuple[int, int, int, int]], out_dir: str, page_key: str, min_side: int = CROP_MIN_SIDE) -> List[Dict[str, Any]]:
-    """Save crops for a page. Only write missing files. Return meta."""
+    """Write crops for a page, upscaling small ones to a minimum side length."""
     os.makedirs(out_dir, exist_ok=True)
     H, W = page_img.shape[:2]
     crops_meta: List[Dict[str, Any]] = []
@@ -179,7 +220,7 @@ def save_crops(page_img: np.ndarray, boxes: List[Tuple[int, int, int, int]], out
 
         crop = page_img[y:y+h, x:x+w]
 
-        # Upscale small crops to a comfortable min-side size for downstream models
+        # Min-side upscale for downstream models
         scale = max(min_side / float(w), min_side / float(h), 1.0)
         if scale > 1.0:
             new_w = int(round(w * scale))
@@ -205,11 +246,13 @@ def _process_one_page(
     out_dir: str,
     dirs: Dict[str, str],
     save_mode: str,
-    compiled_rects_xywh: Optional[Dict[str, List[List[int]]]] = None,  # NEW: whitebox from compiled OCR
+    compiled_rects_xywh: Optional[Dict[str, List[List[int]]]] = None,  # prefer compiled OCR rectangles
 ) -> Tuple[str, List[Dict[str, Any]], List[List[int]], List[Dict[str, Any]], Dict[str, float]]:
-    """Process a single page.
+    """Process one page: load → whitebox text → mask → CC → boxes → crops → timings.
 
-    Returns (pk, entries, boxes_xywh, crops_meta, timings).
+    Returns
+    -------
+    (pk, entries, boxes_xywh, crops_meta, timings)
     """
 
     # --- Timing buckets for this page ---
@@ -256,12 +299,12 @@ def _process_one_page(
         except Exception:
             entries = []
 
-    # Whitebox for thresholding; optionally persist if save_mode='all'
+    # Whitebox then optionally persist masked page
     masked_img = whitebox_text(page_img, entries)
     if save_mode == 'all':
         ensure_jpg(masked_path, masked_img)
 
-    # Prepare threshold source (whiteboxed)
+    # Source for thresholding
     thresh_src = masked_img
 
     # --- Downscale for faster masking/detection (boxes scale back up) ---
@@ -285,10 +328,10 @@ def _process_one_page(
         vis_mask = cv2.resize(mask_small, (W, H), interpolation=cv2.INTER_NEAREST) if scale < 1.0 else mask_small
         imwrite_jpg(mask_img_path, cv2.cvtColor(vis_mask, cv2.COLOR_GRAY2BGR))
 
-    # Detect boxes on small mask using stricter CC with gates + de-dup
+    # Detect boxes on small mask and de-duplicate
     boxes_small = detect_bboxes_from_mask(mask_small)
 
-    # Small-space padding before scaling back up (compensate for thresholding tightness)
+    # Small-space padding before scaling back up
     if BBOX_PAD_SMALL > 0 and boxes_small:
         SH, SW = mask_small.shape[:2]
         padded = []
@@ -332,7 +375,7 @@ def _process_one_page(
             cv2.rectangle(base, (x, y), (x + w, y + h), (0, 255, 0), 2)
         imwrite_jpg(overlay_path, base)
 
-    # Crops — saved in both modes; in 'final' these are the ONLY image files
+    # Crops — written in both modes; in 'final' these are the only images
     if boxes_xywh:
         _t_crop = time.perf_counter()
         for idx, (x, y, w, h) in enumerate(boxes_xywh, start=1):
@@ -365,7 +408,7 @@ def run_image_extraction(
     workers: Optional[int] = None,
     save_mode: str = 'final',  # 'all' or 'final'
 ) -> None:
-    """Run full pipeline; callable from your main."""
+    """Run the figure-extraction pipeline for a PDF into out_dir."""
     pdf_path = os.path.abspath(pdf_path)
     out_dir  = os.path.abspath(out_dir)
 
@@ -449,7 +492,7 @@ def run_image_extraction(
                 out_dir,
                 dirs,
                 save_mode,
-                compiled_rects_xywh,  # NEW: pass compiled rects map
+                compiled_rects_xywh,  # pass compiled rects map
             )
             for pk in page_keys
         ]
@@ -505,7 +548,7 @@ def run_image_extraction(
             'pages_count': 0,
         }
 
-    # Save combined bboxes + manifest (overwrite is OK)
+    # Save combined bboxes + manifest (overwrite OK)
     with open(os.path.join(out_dir, 'bboxes.json'), 'w', encoding='utf-8') as f:
         json.dump(combined_bboxes, f, indent=2)
     with open(os.path.join(out_dir, 'manifest.json'), 'w', encoding='utf-8') as f:

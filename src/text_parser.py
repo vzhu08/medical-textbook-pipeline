@@ -55,7 +55,6 @@ def analyze_text(input_folder: str, output_folder: str, dpi: int = 300):
     Analyze text around image crops using precomputed text_boxes.json and manifest.json.
     input_folder: root containing 'extracted_images' and 'sorted_images/if_skin/skin'
     output_folder: directory to write CSV and text outputs
-    dpi: retained for compatibility (not used here)
     """
     os.makedirs(output_folder, exist_ok=True)
 

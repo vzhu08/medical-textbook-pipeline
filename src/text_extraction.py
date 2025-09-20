@@ -1,26 +1,29 @@
-#!/usr/bin/env python3
 """
 text_extraction.py
 
-Flow you asked for:
-1) Try PyMuPDF4LLM → build Markdown (page_chunks=True, show_progress=True) and a structured JSON
-   with text positions (words and grouped lines).
-2) If PyMuPDF4LLM returns nothing or errors:
-   a) Render pages to images.
-   b) Run PP-StructureV3 (GPU if requested) to get OCR lines + boxes.
-   c) Inject those OCR lines into a copy of the PDF as invisible text.
-   d) Run PyMuPDF4LLM again on the overlaid PDF to produce Markdown + structured JSON.
+Purpose
+-------
+Extract page text and positions from a PDF. Prefer PyMuPDF4LLM for speed and
+layout. If that fails or yields nothing, fall back to OCR, write the OCR text
+back into a copy of the PDF as invisible text, then run PyMuPDF4LLM again.
 
-Outputs (always):
-- out_dir/pm4l.md                  ← concatenated markdown across pages
-- out_dir/text_structure.json      ← organized JSON with positions, keyed by pageN
+Flow
+----
+1) Try PyMuPDF4LLM:
+   - run to_markdown(..., page_chunks=True, extract_words=True)
+   - build:
+       a) concatenated Markdown across pages
+       b) a compact per-page structure with word boxes and grouped line boxes
+2) If PyMuPDF4LLM errors or returns no pages:
+   a) Render pages to images
+   b) Run PP-StructureV3 (GPU if device=="gpu") to get line boxes + texts
+   c) Insert those lines as invisible text into a copy of the PDF
+   d) Re-run PyMuPDF4LLM on the overlaid PDF to produce Markdown + structure
 
-Public call remains:
-    unified_struct = te.run_text_extraction(pdf_path, out_dir, device=device)
-
-Notes:
-- PP-StructureV3 uses text_det_limit_type="max" (a roof).
-- No overlay images. No import checks. Direct imports as requested.
+Outputs (always)
+----------------
+- out_dir/pm4l.md             : concatenated Markdown for all pages
+- out_dir/text_structure.json : {"pageNNN": {"words":[...], "lines":[...]}, ...}
 """
 
 import os
@@ -38,12 +41,12 @@ from paddleocr import PPStructureV3
 
 
 # ---------------- Tunables ----------------
-
+# Render quality and size caps for the OCR fallback path.
 RENDER_DPI = 300
 MAX_LONG_SIDE = 5000
 JPG_QUALITY = 95
 
-# OCR knobs for the PP-Structure fallback
+# OCR controls for PP-StructureV3 fallback
 DET_LIMIT_SIDE_LEN = 1000
 DET_BOX_THRESH     = 0.60
 REC_SCORE_THRESH   = 0.80
@@ -53,10 +56,12 @@ REC_BATCH          = 32
 # ---------------- Small utilities ----------------
 
 def _natkey(s: str):
+    # Natural sort key: splits digits so "page10" sorts after "page9".
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
 def _imread_color_fast(path: str):
+    # Robust image read that tolerates Windows paths and non-ASCII filenames.
     data = np.fromfile(path, dtype=np.uint8)
     if data.size == 0:
         return None
@@ -67,6 +72,7 @@ def _imread_color_fast(path: str):
 
 
 def _imwrite_jpg(path: str, img_bgr: np.ndarray, quality: int = JPG_QUALITY) -> None:
+    # Create parent directory if needed and write a JPEG with given quality.
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     ok = cv2.imwrite(path, img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if not ok:
@@ -77,7 +83,14 @@ def _imwrite_jpg(path: str, img_bgr: np.ndarray, quality: int = JPG_QUALITY) -> 
 
 def _render_pages(pdf_path: str, out_dir: str) -> Tuple[List[str], List[Tuple[int, int]]]:
     """
-    Render PDF pages to JPEGs. Return image paths (ordered) and their (W,H) pixel sizes.
+    Render PDF pages to JPEGs.
+
+    Returns
+    -------
+    image_paths : List[str]
+        Paths in page order: out_dir/page001.jpg, ...
+    sizes : List[(int, int)]
+        (W, H) in pixels for each rendered page after optional downscale.
     """
     os.makedirs(out_dir, exist_ok=True)
     doc = fitz.open(pdf_path)
@@ -109,12 +122,17 @@ def _render_pages(pdf_path: str, out_dir: str) -> Tuple[List[str], List[Tuple[in
 
 def _pm4l_build_markdown_and_structure(pages: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
     """
-    From pm4l page-chunks, build a single markdown string and a compact structure with positions.
-    Structure per page:
+    Build:
+      1) a single Markdown string by concatenating page["text"]
+      2) a compact per-page structure of words and line groups.
+
+    Output structure
+    ----------------
+    For page N (1-based) the key "pageNNN" holds:
       {
-        "page": int,
-        "words": [{"text": str, "bbox": [x0,y0,x1,y1], "block": b, "line": l, "index": w}],
-        "lines": [{"text": str, "bbox": [x0,y0,x1,y1], "block": b, "line": l}]
+        "page": N,
+        "words": [{"text", "bbox", "block", "line", "index"}],
+        "lines": [{"text", "bbox", "block", "line"}]
       }
     """
     # Markdown: concatenate each page's "text"
@@ -124,7 +142,7 @@ def _pm4l_build_markdown_and_structure(pages: List[Dict[str, Any]]) -> Tuple[str
         md_parts.append(t)
     md_text = "\n\n".join(md_parts)
 
-    # Structure: words + grouped lines (from words)
+    # Structure: words + grouped lines
     compiled: Dict[str, Any] = {}
     for p in pages:
         meta = p.get("metadata", {})
@@ -136,7 +154,7 @@ def _pm4l_build_markdown_and_structure(pages: List[Dict[str, Any]]) -> Tuple[str
         by_line: Dict[Tuple[int, int], List[Tuple[float, float, float, float, str]]] = {}
 
         for w in words_raw:
-            # Expected tuple: (x0,y0,x1,y1, "word", bno, lno, wno)
+            # Expected tuple: (x0,y0,x1,y1, "word", block, line, index)
             if not isinstance(w, (list, tuple)) or len(w) < 5:
                 continue
             x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
@@ -155,12 +173,13 @@ def _pm4l_build_markdown_and_structure(pages: List[Dict[str, Any]]) -> Tuple[str
             by_line.setdefault((bno, lno), []).append((x0, y0, x1, y1, text))
 
         lines_out: List[Dict[str, Any]] = []
-        # Keep stable order by block then line
+        # Stable order: by block, then by line number
         for (bno, lno) in sorted(by_line.keys()):
             items = by_line[(bno, lno)]
             xs0 = [it[0] for it in items]; ys0 = [it[1] for it in items]
             xs1 = [it[2] for it in items]; ys1 = [it[3] for it in items]
             line_bbox = [min(xs0), min(ys0), max(xs1), max(ys1)]
+            # Left-to-right within roughly top-to-bottom sorting
             line_text = " ".join(it[4] for it in sorted(items, key=lambda t: (t[1], t[0])))
             lines_out.append({"text": line_text, "bbox": line_bbox, "block": bno, "line": lno})
 
@@ -175,13 +194,20 @@ def _ppstruct_batch_ocr(image_paths: List[str], device: str,
                         det_limit_side_len: int, det_box_thresh: float,
                         rec_score_thresh: float, rec_batch: int) -> List[Dict[str, Any]]:
     """
-    Run PP-StructureV3 in batch and return a list of per-page JSON dicts
-    (read from res.save_to_json outputs).
+    Run PP-StructureV3 on a list of page images and return the JSON outputs.
+
+    Behavior
+    --------
+    - Selects GPU/CPU via paddle.set_device.
+    - Configures detection/recognition thresholds and batch size.
+    - Calls pp.predict(image_paths).
+    - Writes each result with res.save_to_json(...) to a temp folder.
+    - Reads those JSON files back and returns them as a list aligned to image_paths.
     """
-    # Force device
+    # Select device for Paddle runtime
     paddle.set_device("gpu" if device == "gpu" else "cpu")
 
-    # Run PP-StructureV3 with OCR-related knobs, limit_type="max"
+    # Instantiate PP-StructureV3 for OCR only; region/table/formula/chart disabled
     pp = PPStructureV3(
         device=("gpu" if device == "gpu" else "cpu"),
         text_det_limit_side_len=int(det_limit_side_len),
@@ -223,13 +249,12 @@ def _insert_ocr_as_invisible_text(src_pdf: str,
                                   image_sizes: List[Tuple[int, int]],
                                   ppjson_pages: List[Dict[str, Any]]) -> str:
     """
-    Create a new PDF with invisible text boxes inserted at OCR line boxes.
-    Return path to overlaid PDF.
+    Create a new PDF with invisible text added at OCR line boxes.
     """
     doc = fitz.open(src_pdf)
 
     for i, page in enumerate(doc):
-        # Map image pixels → PDF user space
+        # Pixel → point scale factors per page
         Wpx, Hpx = image_sizes[i]
         Wpt, Hpt = page.rect.width, page.rect.height
         sx = Wpt / float(Wpx if Wpx > 0 else 1)
@@ -237,7 +262,7 @@ def _insert_ocr_as_invisible_text(src_pdf: str,
 
         d = ppjson_pages[i]
 
-        # Overall OCR lines
+        # Overall OCR lines (PP-StructureV3 consolidated results)
         ocr = d.get("overall_ocr_res") or {}
         texts = ocr.get("rec_texts") or []
         boxes  = ocr.get("rec_boxes") or []
@@ -247,7 +272,7 @@ def _insert_ocr_as_invisible_text(src_pdf: str,
                 continue
 
             x0, y0, x1, y1 = bb
-            # Fix potential xywh
+            # Handle potential (x, y, w, h)
             if x1 <= x0 or y1 <= y0:
                 x, y, w, h = x0, y0, x1, y1
                 x0, y0, x1, y1 = x, y, x + w, y + h
@@ -257,7 +282,7 @@ def _insert_ocr_as_invisible_text(src_pdf: str,
             rx1, ry1 = float(x1) * sx, float(y1) * sy
             rect = fitz.Rect(rx0, ry0, rx1, ry1)
 
-            # Insert invisible text; small font so it fits the box
+            # Insert invisible text; small fontsize so it stays inside the box
             page.insert_textbox(
                 rect,
                 txt,
@@ -280,25 +305,36 @@ def run_text_extraction(
     out_dir: str,
     device: str = "gpu",
     *,
-    det_limit_side_len: int = DET_LIMIT_SIDE_LEN,   # for fallback OCR
+    det_limit_side_len: int = DET_LIMIT_SIDE_LEN,   # OCR fallback
     det_box_thresh: float = DET_BOX_THRESH,
     rec_score_thresh: float = REC_SCORE_THRESH,
     rec_batch: int = REC_BATCH,
 ) -> Dict[str, str]:
     """
-    Returns:
-      {
-        "markdown_path": "<out_dir>/pm4l.md",
-        "text_structure_path": "<out_dir>/text_structure.json",
-        "source": "pm4l" | "ppstruct+pm4l"
-      }
+    Run text extraction with a PM4L-first strategy and OCR fallback.
+
+    Parameters
+    ----------
+    pdf_path : str
+        Source PDF.
+    out_dir : str
+        Output directory (created if missing).
+    device : {"gpu","cpu"}
+        Paddle device for OCR fallback.
+
+    Returns
+    -------
+    dict with:
+      - "markdown_path": str
+      - "text_structure_path": str
+      - "source": "pm4l" or "ppstruct+pm4l"
     """
     out_dir = str(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     md_path = Path(out_dir) / "pm4l.md"
     struct_path = Path(out_dir) / "text_structure.json"
 
-    # 1) Preferred: PyMuPDF4LLM directly on the PDF
+    # 1) Preferred path: PyMuPDF4LLM directly on the PDF
     try:
         pages = pymupdf4llm.to_markdown(
             pdf_path,
@@ -318,14 +354,14 @@ def run_text_extraction(
                     "source": "pm4l",
                 }
     except Exception as e:
-        # Fall through to OCR path
+        # Fall through to OCR path if PM4L errors
         print(f"[PM4L] primary extraction failed, fallback to OCR. Reason: {e}")
 
-    # 2) Fallback: OCR via PP-Structure → inject invisible text → rerun pm4l
+    # 2) Fallback: OCR → overlay invisible text → re-run PM4L
     pages_dir = os.path.join(out_dir, "page_images")
     image_paths, image_sizes = _render_pages(pdf_path, pages_dir)
 
-    # 2a) OCR
+    # 2a) OCR pages
     pp_pages = _ppstruct_batch_ocr(
         image_paths=image_paths,
         device=device,
@@ -335,7 +371,7 @@ def run_text_extraction(
         rec_batch=rec_batch,
     )
 
-    # 2b) Inject OCR as invisible text into a copy of the PDF
+    # 2b) Write OCR lines into a copy of the PDF as invisible text
     overlay_pdf = _insert_ocr_as_invisible_text(
         src_pdf=pdf_path,
         image_paths=image_paths,
@@ -343,7 +379,7 @@ def run_text_extraction(
         ppjson_pages=pp_pages,
     )
 
-    # 2c) Run pm4l again on the overlaid PDF
+    # 2c) Run PM4L on the overlaid PDF
     pages2 = pymupdf4llm.to_markdown(
         overlay_pdf,
         page_chunks=True,
