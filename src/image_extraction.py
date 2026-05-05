@@ -64,6 +64,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import cv2
 import numpy as np
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Project import
@@ -80,6 +81,8 @@ except Exception:
     pass
 
 # ---- Config ----
+CROP_EXT = ".jpg"
+
 JPG_QUALITY = 95
 CROP_MIN_SIDE = 1024
 
@@ -91,6 +94,29 @@ BBOX_PAD_SMALL = 3           # padding in SMALL-scale pixels before scaling up
 # ---------------------------
 # Low-level helpers
 # ---------------------------
+
+def _page_num_from_key(pk: str) -> int:
+    """
+    Extract trailing integer page number from a page key like 'page0001' or '0001'.
+    Falls back to 0 if not found.
+    """
+    m = re.search(r'(\d+)$', pk)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    try:
+        return int(pk)
+    except ValueError:
+        return 0
+
+def crop_name(pk: str, idx: int, ext: str = CROP_EXT) -> str:
+    """
+    Format: 0000_000.ext  -> page_crop with zero-padding
+    Example: page 1, crop 2 -> 0001_002.jpg
+    """
+    return f"{_page_num_from_key(pk):04d}_{idx:03d}{ext}"
 
 def imwrite_jpg(path: str, img_bgr: np.ndarray, quality: int = JPG_QUALITY) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -227,7 +253,7 @@ def save_crops(page_img: np.ndarray, boxes: List[Tuple[int, int, int, int]], out
             new_h = int(round(h * scale))
             crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-        fname = f"{page_key}_crop{idx:02d}.jpg"
+        fname = crop_name(page_key, idx)
         fpath = os.path.join(out_dir, fname)
         if not os.path.exists(fpath):
             imwrite_jpg(fpath, crop)
@@ -246,315 +272,332 @@ def _process_one_page(
     out_dir: str,
     dirs: Dict[str, str],
     save_mode: str,
-    compiled_rects_xywh: Optional[Dict[str, List[List[int]]]] = None,  # prefer compiled OCR rectangles
+    compiled_rects_xywh: Optional[Dict[str, List[List[int]]]] = None,
 ) -> Tuple[str, List[Dict[str, Any]], List[List[int]], List[Dict[str, Any]], Dict[str, float]]:
-    """Process one page: load → whitebox text → mask → CC → boxes → crops → timings.
-
-    Returns
-    -------
-    (pk, entries, boxes_xywh, crops_meta, timings)
     """
-
-    # --- Timing buckets for this page ---
-    _t_page_start = time.perf_counter()
-    _timings: Dict[str, float] = {
-        'image_load_s': 0.0,
-        'adaptive_mask_s': 0.0,
-        'bbox_cropping_s': 0.0,
-        'total_page_s': 0.0,
+    Process one page:
+      1) load page image
+      2) load entries (text boxes) -> whitebox
+      3) adaptive-mean threshold -> mask_small (inverted)
+      4) detect bboxes -> boxes_xywh
+      5) persist artifacts without re-doing work if files already exist
+    """
+    t0_all = time.perf_counter()
+    timings: Dict[str, float] = {
+        "image_load_s": 0.0,
+        "adaptive_mask_s": 0.0,
+        "bbox_cropping_s": 0.0,
+        "total_page_s": 0.0,
     }
 
     # Paths
-    masked_path    = os.path.join(dirs['masked'],  f"{pk}.jpg")
-    mask_img_path  = os.path.join(dirs['mask'],    f"{pk}.jpg")
-    overlay_path   = os.path.join(dirs['overlay'], f"{pk}.jpg")
-    bbox_json_path = os.path.join(dirs['bbox_pages'], f"{pk}.json")
-    page_img_path  = os.path.join(dirs['pages'],  f"{pk}.jpg")
-    entries_json_path = os.path.join(dirs['entries_pages'], f"{pk}.json")
+    page_img_path      = os.path.join(dirs["pages"],         f"{pk}.jpg")
+    entries_json_path  = os.path.join(dirs["entries_pages"], f"{pk}.json")
+    masked_path        = os.path.join(dirs["masked"],        f"{pk}.jpg")
+    mask_img_path      = os.path.join(dirs["mask"],          f"{pk}.jpg")
+    overlay_path       = os.path.join(dirs["overlay"],       f"{pk}.jpg")
+    bbox_json_path     = os.path.join(dirs["bbox_pages"],    f"{pk}.json")
+
+    # Fast skip when we already have boxes and the source page image
+    if os.path.exists(bbox_json_path) and os.path.exists(page_img_path):
+        try:
+            with open(bbox_json_path, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+            boxes_xywh = [e["rect"] for e in prev if isinstance(e, dict) and "rect" in e]
+            timings["total_page_s"] = time.perf_counter() - t0_all
+            return pk, [], boxes_xywh, [], timings
+        except Exception:
+            pass
 
     # Load page image
-    _t0 = time.perf_counter()
+    t0 = time.perf_counter()
     page_img = cv2.imread(page_img_path)
-    _timings['image_load_s'] += (time.perf_counter() - _t0)
+    timings["image_load_s"] += time.perf_counter() - t0
     if page_img is None:
-        _timings['total_page_s'] = (time.perf_counter() - _t_page_start)
-        return pk, [], [], [], _timings
+        timings["total_page_s"] = time.perf_counter() - t0_all
+        return pk, [], [], [], timings
 
-    # ---- Whiteboxing entries from compiled OCR (preferred) ----
+    H, W = page_img.shape[:2]
+
+    # ---------- entries: load from per-page json or compiled dict ----------
+    # Expected format per entry: {"rect": [x, y, w, h], ...}
     entries: List[Dict[str, Any]] = []
-    used_compiled = False
-    if compiled_rects_xywh and pk in compiled_rects_xywh:
-        # compiled_rects_xywh[pk] is List[List[int]] as xywh
-        for rect in compiled_rects_xywh[pk]:
-            if len(rect) == 4:
-                x, y, w, h = rect
-                entries.append({'rect': [int(x), int(y), max(1, int(w)), max(1, int(h))]})
-        used_compiled = len(entries) > 0
 
-    # Fallback to legacy per-page entries if compiled missing/empty
-    if not used_compiled and os.path.exists(entries_json_path):
+    if os.path.exists(entries_json_path):
         try:
-            with open(entries_json_path, 'r', encoding='utf-8') as f:
-                entries = json.load(f)
+            with open(entries_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Accept either a list[{"rect":[...]}] or {"entries":[...]}
+            if isinstance(data, dict) and "entries" in data:
+                entries = [e for e in data["entries"] if isinstance(e, dict) and "rect" in e]
+            elif isinstance(data, list):
+                entries = [e for e in data if isinstance(e, dict) and "rect" in e]
         except Exception:
             entries = []
+    elif compiled_rects_xywh and pk in compiled_rects_xywh:
+        entries = [{"rect": rect} for rect in compiled_rects_xywh[pk] if isinstance(rect, (list, tuple)) and len(rect) == 4]
 
-    # Whitebox then optionally persist masked page
-    masked_img = whitebox_text(page_img, entries)
-    if save_mode == 'all':
-        ensure_jpg(masked_path, masked_img)
+    # ---------- whitebox using entries ----------
+    # Uses your existing whitebox_text(page_img, entries) if present.
+    # Fallback to a minimal in-place whitebox if whitebox_text is undefined.
+    def _fallback_whitebox(img: np.ndarray, _entries: List[Dict[str, Any]]) -> np.ndarray:
+        out = img.copy()
+        for e in _entries:
+            x, y, w, h = map(int, e["rect"])
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(W, x + w), min(H, y + h)
+            if x1 > x0 and y1 > y0:
+                out[y0:y1, x0:x1] = 255
+        return out
 
-    # Source for thresholding
-    thresh_src = masked_img
+    try:
+        masked_img = whitebox_text(page_img, entries)  # type: ignore[name-defined]
+    except NameError:
+        masked_img = _fallback_whitebox(page_img, entries)
 
-    # --- Downscale for faster masking/detection (boxes scale back up) ---
-    H, W = thresh_src.shape[:2]
+    if save_mode == "all" and not os.path.exists(masked_path):
+        imwrite_jpg(masked_path, masked_img)
+
+    # ---------- adaptive-mean threshold (inverted) to get mask_small ----------
+    # Downscale for speed, remember the scale to re-map boxes.
+    MAX_SIDE = 2000
     scale = 1.0
-    if MASK_DET_LIMIT_SIDE and max(H, W) > MASK_DET_LIMIT_SIDE:
-        scale = MASK_DET_LIMIT_SIDE / float(max(H, W))
-        small_W = max(1, int(round(W * scale)))
-        small_H = max(1, int(round(H * scale)))
-        small_src = cv2.resize(thresh_src, (small_W, small_H), interpolation=cv2.INTER_AREA)
+    h, w = masked_img.shape[:2]
+    longest = max(h, w)
+    if longest > MAX_SIDE:
+        scale = MAX_SIDE / float(longest)
+        masked_small = cv2.resize(masked_img, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_AREA)
     else:
-        small_src = thresh_src
+        masked_small = masked_img
 
-    # Mask (adaptive mean) at small scale
-    _t_mask = time.perf_counter()
-    mask_small = adaptive_mean_mask(small_src)
-    _timings['adaptive_mask_s'] += (time.perf_counter() - _t_mask)
+    t0 = time.perf_counter()
+    gray = cv2.cvtColor(masked_small, cv2.COLOR_BGR2GRAY) if masked_small.ndim == 3 else masked_small
+    # Inverted binary so text/edges are white, background black
+    mask_small = cv2.adaptiveThreshold(
+        gray,
+        maxValue=255,
+        adaptiveMethod=cv2.ADAPTIVE_THRESH_MEAN_C,
+        thresholdType=cv2.THRESH_BINARY_INV,
+        blockSize=35,
+        C=10,
+    )
+    timings["adaptive_mask_s"] += time.perf_counter() - t0
 
-    # Persist the raw mask image if requested
-    if save_mode == 'all':
-        vis_mask = cv2.resize(mask_small, (W, H), interpolation=cv2.INTER_NEAREST) if scale < 1.0 else mask_small
+    if save_mode == "all" and not os.path.exists(mask_img_path):
+        vis_mask = mask_small if scale == 1.0 else cv2.resize(mask_small, (W, H), interpolation=cv2.INTER_NEAREST)
         imwrite_jpg(mask_img_path, cv2.cvtColor(vis_mask, cv2.COLOR_GRAY2BGR))
 
-    # Detect boxes on small mask and de-duplicate
-    boxes_small = detect_bboxes_from_mask(mask_small)
+    # ---------- detect bboxes on mask_small and map back to full-res ----------
+    # Uses your existing detect_bboxes_from_mask; falls back to a simple CC if missing.
+    def _fallback_detect(mask_bin: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w >= 100 and h >= 100:
+                out.append((x, y, w, h))
+        return out
 
-    # Small-space padding before scaling back up
-    if BBOX_PAD_SMALL > 0 and boxes_small:
-        SH, SW = mask_small.shape[:2]
-        padded = []
-        for (x, y, w, h) in boxes_small:
-            x2 = max(0, x - BBOX_PAD_SMALL)
-            y2 = max(0, y - BBOX_PAD_SMALL)
-            w2 = min(SW - x2, w + 2 * BBOX_PAD_SMALL)
-            h2 = min(SH - y2, h + 2 * BBOX_PAD_SMALL)
-            padded.append((x2, y2, w2, h2))
-        boxes_small = padded
+    try:
+        boxes_small = detect_bboxes_from_mask(  # type: ignore[name-defined]
+            mask_small,
+            aspect_range=(0.3, 6.0),
+            morph_kernel=(5, 5),
+            morph_iterations=1,
+            max_page_frac=0.5,
+        )
+    except NameError:
+        boxes_small = _fallback_detect(mask_small)
 
-    # Scale boxes back to original space
-    if scale < 1.0:
-        inv = 1.0 / scale
-        boxes = []
-        for (x, y, w, h) in boxes_small:
-            X = int(round(x * inv))
-            Y = int(round(y * inv))
-            Wb = int(round(w * inv))
-            Hb = int(round(h * inv))
-            X = max(0, min(X, W - 1))
-            Y = max(0, min(Y, H - 1))
-            Wb = max(0, min(Wb, W - X))
-            Hb = max(0, min(Hb, H - Y))
-            if Wb > 0 and Hb > 0:
-                boxes.append((X, Y, Wb, Hb))
-    else:
-        boxes = boxes_small
+    # Map to full-resolution coordinates
+    inv = 1.0 / scale
+    boxes_xywh: List[List[int]] = []
+    for (x, y, w, h) in boxes_small:
+        if scale != 1.0:
+            X = int(round(x * inv)); Y = int(round(y * inv))
+            Wb = int(round(w * inv)); Hb = int(round(h * inv))
+        else:
+            X, Y, Wb, Hb = int(x), int(y), int(w), int(h)
+        # clamp
+        X = max(0, min(X, W - 1)); Y = max(0, min(Y, H - 1))
+        Wb = max(1, min(Wb, W - X)); Hb = max(1, min(Hb, H - Y))
+        boxes_xywh.append([X, Y, Wb, Hb])
 
-    boxes_xywh: List[List[int]] = [[int(x), int(y), int(w), int(h)] for (x, y, w, h) in boxes]
+    # ---------- persist per-page bbox json ----------
+    with open(bbox_json_path, "w", encoding="utf-8") as f:
+        json.dump([{"rect": b} for b in boxes_xywh], f, indent=2)
 
-    # Save per-page bboxes JSON (always)
-    with open(bbox_json_path, 'w', encoding='utf-8') as f:
-        json.dump([{'rect': b} for b in boxes_xywh], f, indent=2)
-
-    # Overlay image (only in 'all')
-    crops_meta: List[Dict[str, Any]] = []
-    if save_mode == 'all':
+    # ---------- overlay (only if absent and save_mode == 'all') ----------
+    if save_mode == "all" and not os.path.exists(overlay_path):
         base = page_img.copy()
-        for (x, y, w, h) in boxes:
+        for (x, y, w, h) in boxes_xywh:
             cv2.rectangle(base, (x, y), (x + w, y + h), (0, 255, 0), 2)
         imwrite_jpg(overlay_path, base)
 
-    # Crops — written in both modes; in 'final' these are the only images
+    # ---------- crops (skip if file exists) ----------
+    crops_meta: List[Dict[str, Any]] = []
     if boxes_xywh:
-        _t_crop = time.perf_counter()
+        t0 = time.perf_counter()
+        CROP_MIN_SIDE = globals().get("CROP_MIN_SIDE", 512)
         for idx, (x, y, w, h) in enumerate(boxes_xywh, start=1):
-            fname = f"{pk}_crop{idx:02d}.jpg"
-            fpath = os.path.join(dirs['crops'], fname)
+            fname = crop_name(pk, idx)
+            fpath = os.path.join(dirs["crops"], fname)
             if not os.path.exists(fpath):
-                crop = page_img[y:y+h, x:x+w]
+                crop = page_img[y:y + h, x:x + w]
                 scale_up = max(CROP_MIN_SIDE / float(w), CROP_MIN_SIDE / float(h), 1.0)
                 if scale_up > 1.0:
                     new_w = int(round(w * scale_up))
                     new_h = int(round(h * scale_up))
                     crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
                 imwrite_jpg(fpath, crop)
-            crops_meta.append({'rect': [x, y, w, h], 'file': fname})
-        _timings['bbox_cropping_s'] += (time.perf_counter() - _t_crop)
+            crops_meta.append({"rect": [x, y, w, h], "file": fname})
+        timings["bbox_cropping_s"] += time.perf_counter() - t0
 
-    # Finalize per-page timings and return
-    _timings['total_page_s'] = (time.perf_counter() - _t_page_start)
-    return pk, entries, boxes_xywh, crops_meta, _timings
+    timings["total_page_s"] = time.perf_counter() - t0_all
+    return pk, entries, boxes_xywh, crops_meta, timings
 
 
 # ---------------------------
-# Public entry (call from your main)
+# Public entry
 # ---------------------------
 
 def run_image_extraction(
     pdf_path: str,
     out_dir: str,
-    device: str = 'gpu',
+    device: str = "gpu",
     workers: Optional[int] = None,
-    save_mode: str = 'final',  # 'all' or 'final'
-) -> None:
-    """Run the figure-extraction pipeline for a PDF into out_dir."""
-    pdf_path = os.path.abspath(pdf_path)
-    out_dir  = os.path.abspath(out_dir)
+    save_mode: str = "final",
+) -> Dict[str, Any]:
+    """
+    Image pass (assumes text pass already writes entries):
+      a) Ensure text extraction bundle is available; read per-page structure.
+      b) Whitebox using <out_dir>/text_boxes_pages/pageNNN.json (or compiled_rects_xywh if present).
+      c) Adaptive-mean mask (in-memory B/W) -> bbox detection.
+      d) Persist per-page and combined outputs, skipping files that already exist.
 
+    Returns a small manifest dict. Artifacts are written to disk.
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    pdf_path = os.path.abspath(pdf_path)
+    out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    # If prior text JSONs exist, reuse; else run text extraction.
-    struct_path = os.path.join(out_dir, 'text_struct.json')
-    boxes_path  = os.path.join(out_dir, 'text_boxes.json')
-
-    # --- Timing: text extraction (includes page renders & OCR) ---
+    # ---- Step 1+2: make sure text extraction ran and load its results ----
     _t_text = time.perf_counter()
-    _text_extracted = False
-    if os.path.exists(struct_path) and os.path.exists(boxes_path):
-        try:
-            with open(struct_path, 'r', encoding='utf-8') as f:
-                unified_struct = json.load(f)
-            print('[IMAGES] Using existing text_struct.json/text_boxes.json — skipping text extraction')
-        except Exception:
-            unified_struct = te.run_text_extraction(pdf_path, out_dir, device=device)
-            _text_extracted = True
-    else:
-        unified_struct = te.run_text_extraction(pdf_path, out_dir, device=device)
-        _text_extracted = True
-    _text_extract_s = (time.perf_counter() - _t_text)
-    print(f"[TIMING] text extraction: {_text_extract_s:.3f}s (ran={_text_extracted})")
 
-    # ---- Load final compiled OCR (preferred for whiteboxing) ----
-    compiled_path = os.path.join(out_dir, 'paddle_compiled.json')
-    compiled_rects_xywh: Dict[str, List[List[int]]] = {}
-    if os.path.exists(compiled_path):
-        try:
-            with open(compiled_path, 'r', encoding='utf-8') as f:
-                compiled = json.load(f)
-            # compiled is {page_key: {"items":[{"bbox_xyxy":[x1,y1,x2,y2], "text":..., "score":...}], ...}, ...}
-            for pk, payload in compiled.items():
-                items = payload.get('items') or []
-                rects_xywh: List[List[int]] = []
-                for it in items:
-                    b = it.get('bbox_xyxy')
-                    if isinstance(b, list) and len(b) == 4:
-                        x1, y1, x2, y2 = [int(v) for v in b]
-                        w = max(1, int(x2 - x1))
-                        h = max(1, int(y2 - y1))
-                        rects_xywh.append([x1, y1, w, h])
-                if rects_xywh:
-                    compiled_rects_xywh[pk] = rects_xywh
-            print(f"[IMAGES] Using paddle_compiled.json for whiteboxing ({len(compiled_rects_xywh)} pages)")
-        except Exception as e:
-            print(f"[IMAGES] Failed to read paddle_compiled.json ({e}); falling back to legacy entries.")
-    else:
-        print("[IMAGES] No paddle_compiled.json found; whiteboxing will fall back to legacy entries if present.")
+    struct_path = os.path.join(out_dir, "text_structure.json")
+    entries_dir = os.path.join(out_dir, "text_boxes_pages")
 
-    # Prepare dirs
+    # Call the new text-extraction entrypoint which returns a bundle.
+    try:
+        bundle = te.run_text_extraction(pdf_path, out_dir, device=device)
+    except Exception:
+        bundle = None
+
+    # Resolve structure from bundle or legacy file if needed.
+    if isinstance(bundle, dict) and isinstance(bundle.get("structure"), dict):
+        structure = bundle["structure"]
+    else:
+        with open(struct_path, "r", encoding="utf-8") as f:
+            structure = json.load(f)
+
+    # Basic sanity: ensure entries exist (text pass should have written them).
+    if not os.path.isdir(entries_dir) or not os.listdir(entries_dir):
+        raise FileNotFoundError(
+            f"Missing per-page entries in {entries_dir}. "
+            f"Text extraction must create text_boxes_pages/pageNNN.json."
+        )
+
+    _text_extract_s = time.perf_counter() - _t_text
+
+    # ---- Step 3: set up IO directories for image artifacts ----
     dirs = {
-        'pages': os.path.join(out_dir, 'page_images'),
-        'masked': os.path.join(out_dir, 'page_masked'),
-        'mask': os.path.join(out_dir, 'page_mask'),
-        'overlay': os.path.join(out_dir, 'page_bbox_overlay'),
-        'crops': os.path.join(out_dir, 'bbox_crops'),
-        'entries_pages': os.path.join(out_dir, 'text_boxes_pages'),
-        'bbox_pages': os.path.join(out_dir, 'bbox_pages'),
+        "pages":   os.path.join(out_dir, "page_images"),
+        "masked":  os.path.join(out_dir, "page_masked"),
+        "mask":    os.path.join(out_dir, "page_mask"),
+        "overlay": os.path.join(out_dir, "page_bbox_overlay"),
+        "crops":   os.path.join(out_dir, "bbox_crops"),
+        "entries_pages": entries_dir,
+        "bbox_pages": os.path.join(out_dir, "bbox_pages"),
     }
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
 
-    combined_bboxes: Dict[str, List[List[int]]] = {}
-    manifest: Dict[str, Any] = {'pages': {}}
+    # Optional compiled rectangles (e.g., from Paddle structure), used for whiteboxing if present.
+    compiled_rects_xywh: Dict[str, List[List[int]]] = {}
+    compiled_path = os.path.join(out_dir, "paddle_compiled.json")
+    if os.path.exists(compiled_path):
+        try:
+            with open(compiled_path, "r", encoding="utf-8") as f:
+                compiled = json.load(f)
+            for pk, payload in compiled.items():
+                rects = []
+                for it in payload.get("items", []):
+                    b = it.get("bbox_xyxy")
+                    if isinstance(b, list) and len(b) == 4:
+                        x1, y1, x2, y2 = [int(v) for v in b]
+                        rects.append([x1, y1, max(1, x2 - x1), max(1, y2 - y1)])
+                if rects:
+                    compiled_rects_xywh[pk] = rects
+            print(f"[IMAGES] Using paddle_compiled.json for whiteboxing ({len(compiled_rects_xywh)} pages)")
+        except Exception as e:
+            print(f"[IMAGES] Failed to parse paddle_compiled.json: {e}")
 
-    page_keys = sorted(unified_struct.keys())
-
-    # Decide workers
+    # ---- Step 4: run per-page processing (whitebox -> adaptive mean -> bboxes) ----
+    page_keys = sorted(structure.keys())
     if workers is None:
         workers = max(1, (os.cpu_count() or 4) - 2)
 
-    # Parallel per-page processing
+    combined_bboxes: Dict[str, List[List[int]]] = {}
+    manifest: Dict[str, Any] = {"pages": {}}
+
+    _tot = {"image_load_s": 0.0, "adaptive_mask_s": 0.0, "bbox_cropping_s": 0.0, "total_page_s": 0.0}
+    _n = 0
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [
-            ex.submit(
-                _process_one_page,
-                pk,
-                out_dir,
-                dirs,
-                save_mode,
-                compiled_rects_xywh,  # pass compiled rects map
-            )
+        futs = [
+            ex.submit(_process_one_page, pk, out_dir, dirs, save_mode, compiled_rects_xywh)
             for pk in page_keys
         ]
-
-        for fut in as_completed(futures):
-            pk, entries, boxes_xywh, crops_meta, _timings = fut.result()
-            if not pk:
-                continue
+        for fut in as_completed(futs):
+            pk, entries, boxes_xywh, crops_meta, t = fut.result()
             combined_bboxes[pk] = boxes_xywh
-            manifest['pages'][pk] = {
-                'text': entries,
-                'bboxes': boxes_xywh,
-                'crops': crops_meta,
-                'timings': _timings,
+            manifest["pages"][pk] = {
+                "text": entries,          # entries used to whitebox this page
+                "bboxes": boxes_xywh,     # final xywh bboxes for figures/photos
+                "crops": crops_meta,      # saved crop files metadata
+                "timings": t,
             }
+            _tot["image_load_s"] += t.get("image_load_s", 0.0)
+            _tot["adaptive_mask_s"] += t.get("adaptive_mask_s", 0.0)
+            _tot["bbox_cropping_s"] += t.get("bbox_cropping_s", 0.0)
+            _tot["total_page_s"] += t.get("total_page_s", 0.0)
+            _n += 1
 
-            print(
-                f"[TIMING][{pk}] image download/load: {_timings.get('image_load_s', 0.0):.3f}s | "
-                f"adaptive means masking: {_timings.get('adaptive_mask_s', 0.0):.3f}s | "
-                f"bbox cropping: {_timings.get('bbox_cropping_s', 0.0):.3f}s | "
-                f"total page: {_timings.get('total_page_s', 0.0):.3f}s"
-            )
+    manifest["timings"] = {
+        "text_extraction_s": _text_extract_s,
+        "per_page_totals": _tot,
+        "per_page_averages": {k: (_tot[k] / _n if _n else 0.0) for k in _tot},
+        "pages_count": _n,
+        "workers": workers,
+        "save_mode": save_mode,
+        "device": device,
+    }
 
-            # Aggregate timings
-            if '_timing_totals' not in locals():
-                _timing_totals = {'image_load_s': 0.0, 'adaptive_mask_s': 0.0, 'bbox_cropping_s': 0.0, 'total_page_s': 0.0}
-                _timing_count = 0
-            _timing_totals['image_load_s'] += _timings.get('image_load_s', 0.0)
-            _timing_totals['adaptive_mask_s'] += _timings.get('adaptive_mask_s', 0.0)
-            _timing_totals['bbox_cropping_s'] += _timings.get('bbox_cropping_s', 0.0)
-            _timing_totals['total_page_s'] += _timings.get('total_page_s', 0.0)
-            _timing_count += 1
-
-    # Timing summary
-    if '_timing_count' in locals() and _timing_count > 0:
-        _avg = {k: (v / _timing_count) for k, v in _timing_totals.items()}
-        print(f"[TIMING] per-page averages over {_timing_count} pages — "
-              f"image download/load: {_avg['image_load_s']:.3f}s | "
-              f"adaptive means masking: {_avg['adaptive_mask_s']:.3f}s | "
-              f"bbox cropping: {_avg['bbox_cropping_s']:.3f}s | "
-              f"total page: {_avg['total_page_s']:.3f}s")
-        manifest['timings'] = {
-            'text_extraction_s': _text_extract_s if '_text_extract_s' in locals() else 0.0,
-            'per_page_totals': _timing_totals,
-            'per_page_averages': _avg,
-            'pages_count': _timing_count,
-        }
-    else:
-        manifest['timings'] = {
-            'text_extraction_s': _text_extract_s if '_text_extract_s' in locals() else 0.0,
-            'per_page_totals': {},
-            'per_page_averages': {},
-            'pages_count': 0,
-        }
-
-    # Save combined bboxes + manifest (overwrite OK)
-    with open(os.path.join(out_dir, 'bboxes.json'), 'w', encoding='utf-8') as f:
+    # ---- Step 5: persist combined outputs ----
+    with open(os.path.join(out_dir, "bboxes.json"), "w", encoding="utf-8") as f:
         json.dump(combined_bboxes, f, indent=2)
-    with open(os.path.join(out_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    print(
-        f"[IMAGES] Done: pages={len(page_keys)} workers={workers} "
-        f"save_mode={save_mode} crops=on"
-    )
+    print(f"[IMAGES] Done: pages={len(page_keys)} workers={workers} save_mode={save_mode}")
+
+    return {
+        "bboxes_path": os.path.join(out_dir, "bboxes.json"),
+        "manifest_path": os.path.join(out_dir, "manifest.json"),
+        "pages": len(page_keys),
+        "workers": workers,
+    }

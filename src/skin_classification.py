@@ -6,7 +6,8 @@ Purpose
 -------
 Segment skin regions in images with a PyTorch UNet, refine masks with a strict,
 edge-preserving DenseCRF, fall back to a simple HSV mask when coverage is too
-small, then compute a representative skin tint. GPU is optional.
+small, then compute a representative skin tint and Monk Skin Tone (via ITA).
+GPU is optional.
 
 Flow
 ----
@@ -21,6 +22,8 @@ Flow
    - Cleanup: drop tiny components and shave mask border.
    - Save masked composites, KMeans clusters, and representative color.
    - Update skin_tones.csv and fallbacks.csv (merged with existing rows).
+     skin_tones.csv columns (extended):
+       filename, skin_tint_0_100, rep_L, rep_a, rep_b, ITA, monk_tone
 3) classify_skin:
    - Orchestrate segmentation + postprocessing with worker resolution.
 
@@ -31,7 +34,7 @@ Outputs
 <output>/probs/<stem>.npy        : float32 prob maps (if CRF enabled)
 <output>/clusters/<stem>_*       : KMeans centers/counts + swatch
 <output>/rep_color/<stem>_*      : representative color chip
-<output>/skin_tones.csv          : filename, L* tint (0–100)
+<output>/skin_tones.csv          : filename, L* tint (0–100) + Monk fields
 <output>/fallbacks.csv           : filename, crf_coverage (0–1) for HSV fallbacks
 
 Access points
@@ -57,10 +60,11 @@ _os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import os
 import csv
+import math
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from contextlib import nullcontext
 import concurrent.futures
 
@@ -75,6 +79,7 @@ try:
     torch.backends.cudnn.benchmark = True
 except Exception:
     pass
+
 
 # ------------------------------ Config ------------------------------
 EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -107,14 +112,69 @@ HSV1_HI = (25, 180, 255)
 HSV2_LO = (160, 30,  60)
 HSV2_HI = (179, 180, 255)
 
-# --- helper: torch AMP context ---
+
+# ------------------------------ Monk scale mapping ------------------------------
+# Bins from user's table, treated as [hi, lo) intervals; exact -100 maps to 10.
+# Each tuple: (monk_label, hi_inclusive, lo_exclusive)
+_MONK_ITA_BINS: Tuple[Tuple[int, float, float], ...] = (
+    (1, 100.0, 81.62),
+    (2, 81.62, 75.99),
+    (3, 75.99, 68.24),
+    (4, 68.24, 57.53),
+    (5, 57.53, 30.61),
+    (6, 30.61, -4.63),
+    (7, -4.63, -37.77),
+    (8, -37.77, -66.87),
+    (9, -66.87, -81.33),
+    (10, -81.33, -100.00),
+)
+
+
+def _map_ita_to_monk(ita: float) -> int:
+    """
+    Map ITA to Monk 1–10 using the configured bins.
+    """
+    for monk, hi, lo in _MONK_ITA_BINS:
+        if (ita <= hi) and (ita > lo):
+            return monk
+
+    # Exact lowest bound
+    if ita == _MONK_ITA_BINS[-1][2]:
+        return _MONK_ITA_BINS[-1][0]
+
+    # Clamp out-of-range
+    if ita > _MONK_ITA_BINS[0][1]:
+        return _MONK_ITA_BINS[0][0]
+    return _MONK_ITA_BINS[-1][0]
+
+
+def _compute_ita(L_star: float, b_star: float) -> float:
+    """
+    ITA = arctan((L* - 50) / b*) * 180 / π, using atan2 for numerical stability.
+    """
+    return math.degrees(math.atan2(L_star - 50.0, b_star))
+
+def _opencv_lab_to_cie(Lab_u8: np.ndarray) -> np.ndarray:
+    """
+    Convert OpenCV Lab (L 0..255, a 0..255, b 0..255 with 128 offset)
+    to CIE L*, a*, b* (L* 0..100, a*,b* centered at 0).
+    Accepts (...,3) array. Returns float32 same shape.
+    """
+    Lab = Lab_u8.astype(np.float32)
+    L_star = Lab[..., 0] * (100.0 / 255.0)
+    a_star = Lab[..., 1] - 128.0
+    b_star = Lab[..., 2] - 128.0
+    return np.stack([L_star, a_star, b_star], axis=-1).astype(np.float32)
+
+# ------------------------------ helper: torch AMP context ------------------------------
 def _amp_autocast(device: str, enabled: bool):
     # Use torch.amp.autocast on CUDA; no-op elsewhere.
     if enabled and device.startswith("cuda"):
         return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
 
-# --- helper: post-processing worker init (no inner OpenCV threads) ---
+
+# ------------------------------ helper: post-processing worker init ------------------------------
 def _init_post_worker():
     try:
         import cv2
@@ -122,7 +182,8 @@ def _init_post_worker():
     except Exception:
         pass
 
-# --- helper: expected outputs for a given file ---
+
+# ------------------------------ helper: expected outputs for a given file ------------------------------
 def _expected_outputs_for(fname: str, output_dir: str):
     stem, _ = os.path.splitext(fname)
     return [
@@ -133,25 +194,85 @@ def _expected_outputs_for(fname: str, output_dir: str):
         os.path.join(output_dir, 'rep_color', f"{stem}_repcolor.png"),
     ]
 
-# --- helper: compute tint from saved npys (no reprocessing needed) ---
-def _tint_from_npys(output_dir: str, stem: str) -> Optional[float]:
+
+# ------------------------------ helpers: metrics from saved npys ------------------------------
+def _load_centers_counts(output_dir: str, stem: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Load cluster centers and counts. Returns None if missing or empty.
+    """
     c_path = os.path.join(output_dir, 'clusters', f"{stem}_centers.npy")
     n_path = os.path.join(output_dir, 'clusters', f"{stem}_counts.npy")
     if not (os.path.exists(c_path) and os.path.exists(n_path)):
         return None
+
     centers = np.load(c_path).astype(np.float32)
     counts  = np.load(n_path).astype(np.float32)
+
     if centers.size == 0 or counts.size == 0:
         return None
+
+    return centers, counts
+
+
+def _rep_metrics_from_npys(output_dir: str, stem: str) -> Optional[Dict[str, float]]:
+    """
+    Compute representative LAB, ITA, Monk from saved centers/counts.
+    Uses the same logic as within _postprocess_file:
+      - take up to top 3 clusters by count
+      - convert their BGR centers to LAB
+      - compute weighted mean L*, a*, b*
+      - compute ITA and Monk from the weighted LAB
+    Returns a dict or None if unavailable.
+    """
+    loaded = _load_centers_counts(output_dir, stem)
+    if loaded is None:
+        return None
+
+    centers, counts = loaded
     top = int(min(3, len(counts)))
     order = np.argsort(counts)[::-1][:top]
-    top_c, top_w = centers[order], counts[order]
-    labs = []
-    for bgr in top_c:
-        labs.append(cv2.cvtColor(np.clip(bgr,0,255).astype(np.uint8)[None,None,:], cv2.COLOR_BGR2LAB)[0,0].astype(np.float32))
-    lab = np.stack(labs, 0)
-    rep = (lab * top_w[:,None]).sum(axis=0) / max(1.0, top_w.sum())
-    return float(round(rep[0] / 2.55, 2))
+
+    # Convert BGR centers to LAB
+    lab_centers = [
+        cv2.cvtColor(
+            np.clip(centers[i], 0, 255).astype(np.uint8)[None, None, :],
+            cv2.COLOR_BGR2LAB
+        )[0, 0].astype(np.float32)
+        for i in order
+    ]
+    lab_centers = np.stack(lab_centers, axis=0)
+
+    # Weighted means in OpenCV Lab
+    w = counts[order].astype(np.float32)
+    wsum = float(w.sum()) if float(w.sum()) != 0.0 else 1.0
+    rep_lab_opencv = (lab_centers * w[:, None]).sum(axis=0) / wsum
+
+    # Convert to true CIE L*, a*, b* for metrics
+    rep_lab_cie = _opencv_lab_to_cie(rep_lab_opencv[None, :])[0]
+
+    L_rep, a_rep, b_rep = float(rep_lab_cie[0]), float(rep_lab_cie[1]), float(rep_lab_cie[2])
+    tint = float(round(L_rep, 2))  # 0–100 already in L*
+
+    ita = _compute_ita(L_rep, b_rep)
+    monk = _map_ita_to_monk(ita)
+
+    return {
+        "rep_L": L_rep,
+        "rep_a": a_rep,
+        "rep_b": b_rep,
+        "skin_tint_0_100": tint,
+        "ITA": ita,
+        "monk_tone": monk,
+    }
+
+
+def _tint_from_npys(output_dir: str, stem: str) -> Optional[float]:
+    """
+    Backward-compat helper used elsewhere. Returns only the L*-derived tint (0–100).
+    """
+    m = _rep_metrics_from_npys(output_dir, stem)
+    return None if m is None else float(m["skin_tint_0_100"])
+
 
 # ------------------------------ layers.py (inline) ------------------------------
 class _Layers:
@@ -166,6 +287,7 @@ class _Layers:
             nn.BatchNorm2d(out_ch),
         )
 layers = _Layers()
+
 
 # ------------------------------ model.py (inline) ------------------------------
 class UNet(nn.Module):
@@ -203,6 +325,7 @@ class UNet(nn.Module):
         x11 = self.final_double_conv(x10)
         return self.sigmoid(self.final_conv(x11))  # (B,1,H,W)
 
+
 # ------------------------------ Checkpoint loader ------------------------------
 def abd_load_torch_unet(abd_model_path: str, device: str = "cpu") -> Tuple[nn.Module, str]:
     if not os.path.isfile(abd_model_path):
@@ -238,6 +361,7 @@ def abd_load_torch_unet(abd_model_path: str, device: str = "cpu") -> Tuple[nn.Mo
     model.to(device).eval()
     return model, device
 
+
 # ------------------------------ Worker/shared globals ------------------------------
 _G_MODEL = None
 _G_DEVICE = "cpu"
@@ -248,15 +372,18 @@ _G_BATCH = DEFAULT_BATCH
 _G_SAVE_PROBS = False
 _G_PROBS_DIR = None
 
-# --- worker resolvers ---
+
+# ------------------------------ worker resolvers ------------------------------
 def _resolve_seg_workers(provided: Optional[int]) -> int:
     return max(1, int(provided)) if provided is not None else 1
+
 
 def _resolve_post_workers(provided: Optional[int]) -> int:
     if provided is not None:
         return max(1, int(provided))
     cpu = os.cpu_count() or 1
     return max(1, cpu - 2)
+
 
 def _init_abd_worker(model_path: str, input_size: int, thr: float, batch_size: int,
                      save_probs: bool=False, probs_dir: Optional[str]=None, prob_format: str="npy"):
@@ -274,6 +401,7 @@ def _init_abd_worker(model_path: str, input_size: int, thr: float, batch_size: i
     _G_SAVE_PROBS = bool(save_probs)
     _G_PROBS_DIR = probs_dir
     _G_MODEL, _ = abd_load_torch_unet(model_path, device=_G_DEVICE)
+
 
 @torch.inference_mode()
 def _predict_chunk(img_paths, in_size, thr, model, device, return_probs: bool = False, use_amp: bool = False):
@@ -303,6 +431,7 @@ def _predict_chunk(img_paths, in_size, thr, model, device, return_probs: bool = 
         outs.append((p, m, prob) if return_probs else (p, m))
     return outs
 
+
 def _abd_worker_chunk(paths: List[str], masks_dir: str) -> int:
     total = 0
     model = _G_MODEL
@@ -321,6 +450,7 @@ def _abd_worker_chunk(paths: List[str], masks_dir: str) -> int:
             total += 1
     return total
 
+
 def run_segmentation_abd(
     input_dir: str,
     masks_dir: str,
@@ -334,7 +464,7 @@ def run_segmentation_abd(
     save_probs: bool = False,
     probs_dir: Optional[str] = None,
     prob_format: str = "npy",
-    use_gpu: bool = True,  # <— NEW: GPU toggle
+    use_gpu: bool = True,  # <— GPU toggle
 ) -> None:
     os.makedirs(masks_dir, exist_ok=True)
     if save_probs:
@@ -416,14 +546,15 @@ def run_segmentation_abd(
             except Exception as e:
                 print("[SEG][ERR] worker failed:", e)
 
+
 # ------------------------------ STRICT CRF ------------------------------
 def _refine_with_crf(img_bgr: np.ndarray, prob01: np.ndarray, iters: int = CRF_ITERS) -> np.ndarray:
     H, W = prob01.shape
     CRF_MAX_PIXELS = 1_800_000
     scale = 1.0
     if H * W > CRF_MAX_PIXELS:
-        import math
-        scale = math.sqrt(CRF_MAX_PIXELS / float(H * W))
+        import math as _math
+        scale = _math.sqrt(CRF_MAX_PIXELS / float(H * W))
         newW = max(32, int(W * scale)); newH = max(32, int(H * scale))
         img = cv2.resize(img_bgr, (newW, newH), interpolation=cv2.INTER_AREA)
         prb = cv2.resize(prob01,  (newW, newH), interpolation=cv2.INTER_LINEAR)
@@ -448,6 +579,7 @@ def _refine_with_crf(img_bgr: np.ndarray, prob01: np.ndarray, iters: int = CRF_I
         return cv2.resize(m_small, (W, H), interpolation=cv2.INTER_NEAREST)
     return m_small
 
+
 # ------------------------------ Helpers: fallback + cleanup ------------------------------
 def _hsv_skin_fallback(img_bgr: np.ndarray) -> np.ndarray:
     """Simple HSV-based skin mask (union of two hue bands). Returns 0/255 mask."""
@@ -456,6 +588,7 @@ def _hsv_skin_fallback(img_bgr: np.ndarray) -> np.ndarray:
     m2 = cv2.inRange(hsv, np.array(HSV2_LO, np.uint8), np.array(HSV2_HI, np.uint8))
     mask = cv2.bitwise_or(m1, m2)
     return mask
+
 
 def _erode_mask_border(mask: np.ndarray, frac: float) -> np.ndarray:
     """
@@ -479,6 +612,7 @@ def _erode_mask_border(mask: np.ndarray, frac: float) -> np.ndarray:
     eroded = eroded[pad:-pad, pad:-pad]
     return eroded
 
+
 def _remove_small_components(mask: np.ndarray, min_frac: float) -> np.ndarray:
     """Keep CCs whose area >= min_frac * image_area."""
     m = (mask > 0).astype(np.uint8)
@@ -492,6 +626,7 @@ def _remove_small_components(mask: np.ndarray, min_frac: float) -> np.ndarray:
         if int(stats[lbl, cv2.CC_STAT_AREA]) >= min_area:
             keep[labels == lbl] = 1
     return (keep * 255).astype(np.uint8)
+
 
 # ------------------------------ Post-processing ------------------------------
 def _postprocess_file(fname: str, input_dir: str, output_dir: str, k_unused: int) -> Tuple[str, Optional[float], bool, float]:
@@ -528,7 +663,6 @@ def _postprocess_file(fname: str, input_dir: str, output_dir: str, k_unused: int
         if crf_mask.shape[:2] != (H, W):
             crf_mask = cv2.resize(crf_mask, (W, H), interpolation=cv2.INTER_NEAREST)
         mask = crf_mask
-
 
     crf_coverage = float(np.count_nonzero(mask) / float(H * W))
 
@@ -580,24 +714,37 @@ def _postprocess_file(fname: str, input_dir: str, output_dir: str, k_unused: int
             swatch[:, i*50:(i+1)*50] = np.clip(col, 0, 255).astype(np.uint8)
         cv2.imwrite(cluster_png, swatch)
 
-    # Weighted LAB → L*
+    # Weighted LAB → L*, a*, b* (top-3 clusters)
     top = min(3, len(counts))
     order = np.argsort(counts)[::-1][:top]
     top_c = centers[order]; top_w = counts[order].astype(np.float32)
-    lab_centers = [cv2.cvtColor(np.clip(bgr,0,255).astype(np.uint8)[None,None,:], cv2.COLOR_BGR2LAB)[0,0].astype(np.float32)
-                   for bgr in top_c]
-    lab_centers = np.stack(lab_centers, 0)
-    rep_lab = (lab_centers * top_w[:,None]).sum(axis=0) / max(1.0, top_w.sum())
-    tint = float(rep_lab[0] / 2.55)
 
+    # Weighted OpenCV Lab of top-3 cluster centers
+    lab_centers = [
+        cv2.cvtColor(
+            np.clip(bgr, 0, 255).astype(np.uint8)[None, None, :],
+            cv2.COLOR_BGR2LAB
+        )[0, 0].astype(np.float32)
+        for bgr in top_c
+    ]
+    lab_centers = np.stack(lab_centers, 0)
+    wsum = float(top_w.sum()) if float(top_w.sum()) != 0.0 else 1.0
+    rep_lab_opencv = (lab_centers * top_w[:, None]).sum(axis=0) / wsum
+
+    # Save rep color chip using OpenCV Lab → BGR
     rep_png = os.path.join(rep_dir, f"{stem}_repcolor.png")
     if not os.path.exists(rep_png):
-        rep_lab_u8 = np.clip(np.round(rep_lab), 0, 255).astype(np.uint8)[None,None,:]
-        bgr = cv2.cvtColor(rep_lab_u8, cv2.COLOR_LAB2BGR)[0,0]
-        chip = np.zeros((50,50,3), np.uint8); chip[:] = bgr
+        rep_lab_u8 = np.clip(np.round(rep_lab_opencv), 0, 255).astype(np.uint8)[None, None, :]
+        bgr = cv2.cvtColor(rep_lab_u8, cv2.COLOR_LAB2BGR)[0, 0]
+        chip = np.zeros((50, 50, 3), np.uint8);
+        chip[:] = bgr
         cv2.imwrite(rep_png, chip)
 
+    # Convert to CIE for metrics and legacy tint
+    rep_lab_cie = _opencv_lab_to_cie(rep_lab_opencv[None, :])[0]
+    tint = float(rep_lab_cie[0])  # already 0–100
     return (fname, tint, used_fallback, crf_coverage)
+
 
 def run_postprocessing(
     input_dir: str,
@@ -646,33 +793,69 @@ def run_postprocessing(
 
     # ------- Merge/update CSVs without losing previous rows -------
 
-    # 1) skin_tones.csv
+    # 1) skin_tones.csv  (now extended with rep_L, rep_a, rep_b, ITA, monk_tone)
     tones_csv = os.path.join(output_dir, 'skin_tones.csv')
-    tones_map = {}
+
+    # Load any existing rows to preserve past entries and columns
+    existing_rows: Dict[str, Dict[str, str]] = {}
+    existing_fields: List[str] = []
     if os.path.exists(tones_csv):
         with open(tones_csv, newline='', encoding='utf-8') as f:
-            for row in csv.DictReader(f):
-                tones_map[row['filename']] = row.get('skin_tint_0_100', '')
+            rdr = csv.DictReader(f)
+            existing_fields = list(rdr.fieldnames or [])
+            for row in rdr:
+                fn = row.get('filename')
+                if fn:
+                    existing_rows[fn] = dict(row)
 
-    # update with new results
+    # Update legacy tint values from this run (if any)
     for fn, ti, _, _ in results:
         if ti is not None:
-            tones_map[fn] = f"{ti:.2f}"
+            r = existing_rows.get(fn, {"filename": fn})
+            r["skin_tint_0_100"] = f"{ti:.2f}"
+            existing_rows[fn] = r
 
-    # ensure every file with cluster npys is represented (fill from npys if missing)
+    # Ensure every file with cluster npys is represented and compute full metrics
     for f in files_with_masks:
-        if f not in tones_map or tones_map[f] in (None, ''):
-            stem, _ = os.path.splitext(f)
-            ti = _tint_from_npys(output_dir, stem)
-            if ti is not None:
-                tones_map[f] = f"{ti:.2f}"
-            else:
-                tones_map.setdefault(f, '')
+        stem, _ = os.path.splitext(f)
+        metrics = _rep_metrics_from_npys(output_dir, stem)
+        r = existing_rows.get(f, {"filename": f})
 
+        if metrics is not None:
+            # Overwrite or fill with authoritative metrics from saved npys
+            r["skin_tint_0_100"] = f"{metrics['skin_tint_0_100']:.2f}"
+            r["rep_L"] = f"{metrics['rep_L']:.6f}"
+            r["rep_a"] = f"{metrics['rep_a']:.6f}"
+            r["rep_b"] = f"{metrics['rep_b']:.6f}"
+            r["ITA"]   = f"{metrics['ITA']:.6f}"
+            r["monk_tone"] = str(int(metrics["monk_tone"]))
+        else:
+            # Keep legacy behavior if metrics cannot be computed yet
+            if "skin_tint_0_100" not in r or r["skin_tint_0_100"] in (None, ""):
+                ti = _tint_from_npys(output_dir, stem)
+                if ti is not None:
+                    r["skin_tint_0_100"] = f"{ti:.2f}"
+
+        existing_rows[f] = r
+
+    # Define canonical field order; include any unknown prior fields at the end
+    canonical_fields = [
+        "filename",
+        "skin_tint_0_100",
+        "rep_L", "rep_a", "rep_b",
+        "ITA", "monk_tone",
+    ]
+    # Append any older extra columns so we never drop data
+    for fld in existing_fields:
+        if fld not in canonical_fields:
+            canonical_fields.append(fld)
+
+    # Write CSV
     with open(tones_csv, 'w', newline='', encoding='utf-8') as f:
-        wr = csv.writer(f); wr.writerow(['filename', 'skin_tint_0_100'])
-        for fn in sorted(tones_map):
-            wr.writerow([fn, tones_map[fn]])
+        wr = csv.DictWriter(f, fieldnames=canonical_fields)
+        wr.writeheader()
+        for fn in sorted(existing_rows):
+            wr.writerow(existing_rows[fn])
     print(f"[POST] Wrote {tones_csv}")
 
     # 2) fallbacks.csv (merge existing + new)
@@ -697,6 +880,7 @@ def run_postprocessing(
             wr.writerow([fn, fb_map[fn]])
     print(f"[POST] Wrote {fb_csv} ({len(fb_map)} total fallbacks)")
 
+
 # ------------------------------ Orchestrator ------------------------------
 def classify_skin(
     input_dir: str,
@@ -711,7 +895,7 @@ def classify_skin(
     post_workers: Optional[int] = None,
     workers: Optional[int] = None,
     use_crf: bool = USE_CRF_DEFAULT,
-    use_gpu: bool = True,   # <— NEW: pass from main.py
+    use_gpu: bool = True,   # pass from main.py
 ) -> None:
     for sub in ['masks','masked','clusters','rep_color'] + (['probs'] if use_crf else []):
         os.makedirs(os.path.join(output_dir, sub), exist_ok=True)
@@ -751,7 +935,7 @@ def classify_skin(
         save_probs=use_crf,
         probs_dir=os.path.join(output_dir, 'probs') if use_crf else None,
         prob_format="npy",
-        use_gpu=use_gpu,  # <— NEW
+        use_gpu=use_gpu,
     )
 
     run_postprocessing(

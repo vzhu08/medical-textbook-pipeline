@@ -1,8 +1,4 @@
 # main.py
-# -----------------------------------------------------------------------------
-# Run each pipeline stage in its own Python process to prevent CUDA/DLL clashes
-# between PaddleOCR and PyTorch.
-# -----------------------------------------------------------------------------
 
 import os
 import glob
@@ -15,15 +11,16 @@ import sys
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline switches (toggle steps on/off)
+# Pipeline control flags
 # ──────────────────────────────────────────────────────────────────────────────
 RUN_EXTRACTION = True           # Extract images from PDF
-RUN_FILTER_PHOTO = False        # Filter images into photos vs illustrations
-RUN_FILTER_SKIN = False         # Filter photos into skin vs no_skin
-RUN_FILTER_GENDER = False       # Filter photos into male vs female
-RUN_FILTER_RACE = False         # Filter photos into putative race
-RUN_SKIN_CLASSER = False        # Identify skin tone
-RUN_TEXT = False                # Run text analysis
+RUN_FILTER_PHOTO = True         # Filter images into photos vs illustrations
+RUN_FILTER_SKIN = False          # Filter photos into skin vs no_skin
+RUN_FILTER_GENDER = False        # Filter photos into male vs female
+RUN_FILTER_RACE = False          # Filter photos into putative race
+RUN_SKIN_CLASSER = False         # Identify skin tone
+RUN_TEXT = False                 # Run text analysis
+RUN_SUMMARIZE = True            # Build final Image/Text datasets
 
 WORKERS = 12
 USE_GPU = True
@@ -32,7 +29,7 @@ abd_model_path = "models/abd-skin-segmentation/final_unet_pytorch.pth"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers (format durations, print banners, wrap timed calls)
+# Helper
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _fmt_secs(s: float) -> str:
@@ -60,9 +57,9 @@ def _timed_call(stage_name, fn, *args, **kwargs):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Subprocess runner
-# Import <module_path>, call <func_name>(**kwargs) in a clean interpreter.
-# Kwargs are serialized to a temp JSON file to handle complex types safely.
+# Subprocess utility: import a module and call a function(**kwargs) in a CLEAN
+# Python interpreter. We pass kwargs via a temp JSON file to avoid shell quoting
+# issues and to support complex types (lists, dicts, etc.).
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run_stage_subprocess(module_path: str, func_name: str, kwargs: dict, *, env=None, cwd: str | None = None) -> None:
@@ -83,24 +80,18 @@ def _run_stage_subprocess(module_path: str, func_name: str, kwargs: dict, *, env
             kwargs = json.load(f)
         mod = importlib.import_module('{module_path}')
         fn = getattr(mod, '{func_name}')
-        # Call and flush any prints the stage may produce
         rv = fn(**kwargs)
-        # If the function returns, we consider it success.
-        # Non-zero exit will be triggered by raised exceptions.
         """
     ).strip()
 
-    # Serialize kwargs so the child can read them
     with tempfile.TemporaryDirectory() as td:
         args_json = Path(td) / "kwargs.json"
         args_json.write_text(json.dumps(kwargs, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Compose child environment by overlaying any overrides
         child_env = os.environ.copy()
         if env:
             child_env.update(env)
 
-        # Use the same interpreter as the parent (respects venv)
         cmd = [sys.executable, "-c", bootstrap, str(args_json)]
         proc = subprocess.run(cmd, env=child_env, cwd=cwd or os.getcwd())
         if proc.returncode != 0:
@@ -110,16 +101,16 @@ def _run_stage_subprocess(module_path: str, func_name: str, kwargs: dict, *, env
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-PDF processing (each step invoked via a subprocess)
+# Per-PDF processing (subprocess calls for each step)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def process_pdf(pdf_path: str):
     _banner(f"Processing PDF: {os.path.basename(pdf_path)}")
 
-    # Base name (no extension) for this textbook
+    # Derive base name (without extension) for this textbook
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
 
-    # Output layout for this textbook
+    # Create a separate data directory for each textbook
     base_dir = os.path.join("data", base_name)
     extracted_dir = os.path.join(base_dir, "extracted_images")
     sorted_dir = os.path.join(base_dir, "sorted_images")
@@ -129,6 +120,7 @@ def process_pdf(pdf_path: str):
     race_sort_dir = os.path.join(sorted_dir, "race")
     skin_class_dir = os.path.join(base_dir, "skin_class")
     text_dir = os.path.join(base_dir, "text_analysis")
+    final_dir = os.path.join(base_dir, "final_datasets")  # new stage output
 
     # Ensure directories exist
     for d in (
@@ -141,13 +133,14 @@ def process_pdf(pdf_path: str):
         race_sort_dir,
         skin_class_dir,
         text_dir,
+        final_dir,   # ensure output exists for summary stage
     ):
         os.makedirs(d, exist_ok=True)
 
-    # Timings per step for this PDF
+    # Stage timings (per PDF)
     stage_times: dict[str, float] = {}
 
-    # Step 1: extract all images from the PDF
+    # Step 1: Extract all images from the PDF (subprocess)
     if RUN_EXTRACTION:
         def _extract():
             _run_stage_subprocess(
@@ -159,15 +152,14 @@ def process_pdf(pdf_path: str):
                     "workers": WORKERS,
                     "save_mode": "final"
                 },
-                # env: default
             )
-        _, dt = _timed_call("1/7 Extract Images", _extract)
+        _, dt = _timed_call("1/8 Extract Images", _extract)
         stage_times["extract"] = dt
     else:
-        print("[1/7 Extract Images] skipped (flag off)")
+        print("[1/8 Extract Images] skipped (flag off)")
         stage_times["extract"] = 0.0
 
-    # Step 2: CLIP filter — photos vs illustrations
+    # Step 2: First-level CLIP filtering (photos vs illustrations) (subprocess)
     if RUN_FILTER_PHOTO:
         photo_labels = [
             "a photograph",
@@ -204,13 +196,13 @@ def process_pdf(pdf_path: str):
                     "use_gpu": USE_GPU,
                 },
             )
-        _, dt = _timed_call("2/7 CLIP Filter: photo vs illustration", _clip_photo)
+        _, dt = _timed_call("2/8 CLIP Filter: photo vs illustration", _clip_photo)
         stage_times["clip_photo"] = dt
     else:
-        print("[2/7 CLIP Filter: photo vs illustration] skipped (flag off)")
+        print("[2/8 CLIP Filter: photo vs illustration] skipped (flag off)")
         stage_times["clip_photo"] = 0.0
 
-    # Step 3: CLIP filter — skin vs no_skin
+    # Step 3: Second-level CLIP filtering (skin vs no_skin) (subprocess)
     if RUN_FILTER_SKIN:
         skin_labels = [
             "a human",
@@ -264,13 +256,13 @@ def process_pdf(pdf_path: str):
                     "use_gpu": USE_GPU,
                 },
             )
-        _, dt = _timed_call("3/7 CLIP Filter: skin vs no_skin", _clip_skin)
+        _, dt = _timed_call("3/8 CLIP Filter: skin vs no_skin", _clip_skin)
         stage_times["clip_skin"] = dt
     else:
-        print("[3/7 CLIP Filter: skin vs no_skin] skipped (flag off)")
+        print("[3/8 CLIP Filter: skin vs no_skin] skipped (flag off)")
         stage_times["clip_skin"] = 0.0
 
-    # Step 4: CLIP filter — male vs female
+    # Step 4: Third-level CLIP filtering (male vs female) (subprocess)
     if RUN_FILTER_GENDER:
         male_labels = [
             "a biological male",
@@ -278,6 +270,7 @@ def process_pdf(pdf_path: str):
             "a man",
             "a male patient",
             "a male body",
+            "male genitalia",
             "a penis"
         ]
         female_labels = [
@@ -287,6 +280,7 @@ def process_pdf(pdf_path: str):
             "a female patient",
             "a female body",
             "human female breasts",
+            "female genitalia",
             "a vagina",
         ]
 
@@ -299,7 +293,7 @@ def process_pdf(pdf_path: str):
                     "output_folder": gender_sort_dir,
                     "use_mean": False,
                     "include_uncertain": True,
-                    "uncertainty_threshold": 0.02,
+                    "uncertainty_threshold": 0.01,
                     "categories": {
                         "male": male_labels,
                         "female": female_labels,
@@ -309,39 +303,57 @@ def process_pdf(pdf_path: str):
                 },
             )
 
-        _, dt = _timed_call("4/7 CLIP Filter: male vs female", _clip_gender)
+        _, dt = _timed_call("4/8 CLIP Filter: male vs female", _clip_gender)
         stage_times["_clip_gender"] = dt
     else:
-        print("[4/7 CLIP Filter: male vs female] skipped (flag off)")
+        print("[4/8 CLIP Filter: male vs female] skipped (flag off)")
         stage_times["_clip_gender"] = 0.0
 
-    # Step 5: CLIP filter — putative race
+    # Step 5: Fourth-level CLIP filtering (putative race) (subprocess)
     if RUN_FILTER_RACE:
         black_labels = [
-            "a black person",
-            "an african person",
-            "a african american person",
-            "a black person's skin",
-            "an african person's skin",
+            "a body part of a Black person",
+            "a body part with Black skin",
+            "a Black patient",
+            "a Black patient's skin",
+            "a Black person",
+            "an African person",
+            "an African American person",
+            "a Black person's skin",
+            "an African person's skin",
         ]
         white_labels = [
-            "a white person",
-            "a caucasian person",
-            "a eastern european person",
-            "a white person's skin",
+            "a body part of a White person",
+            "a body part with White skin",
+            "a White patient",
+            "a White patient's skin",
+            "a White person",
+            "a Caucasian person",
+            "an Eastern European person",
+            "a White person's skin",
         ]
         asian_labels = [
-            "an asian person",
-            "an asian person's skin",
-            "asian skin"
+            "a body part of an Asian person",
+            "a body part with Asian skin",
+            "an Asian patient",
+            "an Asian patient's skin",
+            "an Asian person",
+            "an Asian person's skin",
+            "Asian skin"
         ]
         latine_labels = [
-            "a latine person",
-            "a latinx person",
-            "a latino person",
-            "latine skin",
-            "latinx skin",
-            "latino skin"
+            "a body part of a Latine person",
+            "a body part with Latine skin",
+            "a Latine patient",
+            "a Latino patient",
+            "a Latine patient's skin",
+            "a Latino patient's skin",
+            "a Latine person",
+            "a Latinx person",
+            "a Latino person",
+            "Latine skin",
+            "Latinx skin",
+            "Latino skin"
         ]
 
         def _clip_race():
@@ -351,9 +363,9 @@ def process_pdf(pdf_path: str):
                 kwargs={
                     "input_folder": os.path.join(skin_sort_dir, "skin"),
                     "output_folder": race_sort_dir,
-                    "use_mean": True,
+                    "use_mean": False,
                     "include_uncertain": True,
-                    "uncertainty_threshold": 0.02,
+                    "uncertainty_threshold": 0.005,
                     "categories": {
                         "black": black_labels,
                         "white": white_labels,
@@ -365,13 +377,13 @@ def process_pdf(pdf_path: str):
                 },
             )
 
-        _, dt = _timed_call("5/7 CLIP Filter: putative race", _clip_race)
+        _, dt = _timed_call("5/8 CLIP Filter: putative race", _clip_race)
         stage_times["_clip_race"] = dt
     else:
-        print("[5/7 CLIP Filter: putative race] skipped (flag off)")
+        print("[5/8 CLIP Filter: putative race] skipped (flag off)")
         stage_times["_clip_race"] = 0.0
 
-    # Step 6: skin tone classification
+    # Step 6: Skin tone classification (subprocess)
     if RUN_SKIN_CLASSER:
         def _skin_class():
             _run_stage_subprocess(
@@ -385,30 +397,48 @@ def process_pdf(pdf_path: str):
                     "use_gpu": USE_GPU,
                 },
             )
-        _, dt = _timed_call("6/7 Skin Classification", _skin_class)
+        _, dt = _timed_call("6/8 Skin Classification", _skin_class)
         stage_times["skin_class"] = dt
     else:
-        print("[6/7 Skin Classification] skipped (flag off)")
+        print("[6/8 Skin Classification] skipped (flag off)")
         stage_times["skin_class"] = 0.0
 
-    # Step 7: optional text analysis
+    # Step 7: Text analysis (optional) (subprocess)
     if RUN_TEXT:
         def _text():
             _run_stage_subprocess(
                 module_path="src.text_parser",
-                func_name="analyze_text",
+                func_name="analyze_text_llm",
                 kwargs={
-                    "input_folder": base_dir,
-                    "output_folder": text_dir,
+                    "input_dir": extracted_dir,
+                    "output_dir": text_dir,
                 },
             )
-        _, dt = _timed_call("7/7 Text Analysis", _text)
+        _, dt = _timed_call("7/8 Text Analysis", _text)
         stage_times["text"] = dt
     else:
-        print("[7/7 Text Analysis] skipped (flag off)")
+        print("[7/8 Text Analysis] skipped (flag off)")
         stage_times["text"] = 0.0
 
-    # Per-PDF summary
+    # Step 8: Final dataset summarization (subprocess)
+    if RUN_SUMMARIZE:
+        def _summarize():
+            # Use the book's base_dir as input; write CSVs to final_dir
+            _run_stage_subprocess(
+                module_path="src.summarize_results",
+                func_name="summarize_results",
+                kwargs={
+                    "input_dir": base_dir,
+                    "output_dir": final_dir,
+                },
+            )
+        _, dt = _timed_call("8/8 Final Datasets Summary", _summarize)
+        stage_times["summarize"] = dt
+    else:
+        print("[8/8 Final Datasets Summary] skipped (flag off)")
+        stage_times["summarize"] = 0.0
+
+    # Summary for this PDF
     total = sum(stage_times.values())
     _banner(f"Finished '{base_name}' in {_fmt_secs(total)}")
     print("Stage breakdown:")
@@ -422,7 +452,7 @@ def process_pdf(pdf_path: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Find all PDFs under textbook_inputs/
+    # Find all PDF files in the input folder
     input_pattern = os.path.join("textbook_inputs", "*.pdf")
     all_pdfs = sorted(glob.glob(input_pattern))
 
