@@ -9,10 +9,11 @@ routes files whose top-1 vs top-2 decision margin is below a threshold.
 
 Flow
 ----
-1) Prepare folders under output_folder for each category (+ optional 'uncertain').
-2) Load CLIP once, tokenize all label prompts, compute normalized text embeddings.
-3) Collect input images from input_folder.
-4) Process in batches:
+1) If output_folder/clip_similarity_scores.json and category folders exist, reuse cached outputs.
+2) Prepare folders under output_folder for each category (+ optional 'uncertain').
+3) Load CLIP once, tokenize all label prompts, compute normalized text embeddings.
+4) Collect input images from input_folder.
+5) Process in batches:
    - compute image embeddings
    - cosine similarities to all labels
    - aggregate per-category scores (mean and max)
@@ -20,7 +21,7 @@ Flow
    - apply uncertainty test on decision scores; route if needed
    - copy image to destination subfolder
    - record per-image details for JSON
-5) Write output_folder/clip_similarity_scores.json with scores and routing.
+6) Write output_folder/clip_similarity_scores.json with scores and routing.
 
 Outputs
 -------
@@ -41,6 +42,7 @@ Notes
 -----
 - Decision scores are per-category. When use_mean=True, decisions use category means;
   otherwise they use category maxima. The uncertainty check compares those decision scores.
+- Existing score JSONs plus expected category folders are treated as complete stage outputs.
 - GPU runs sequential batches with autocast; CPU uses a thread pool for batches.
 - JSON includes per-label scores, per-category mean/max, the decision vector,
   chosen category, uncertainty flag, and margin between top-2 decisions.
@@ -165,10 +167,18 @@ def filter_with_clip(
       - chosen category and uncertainty info
     """
 
+    os.makedirs(output_folder, exist_ok=True)
+    json_path = os.path.join(output_folder, scores_json_name)
+    cache_dirs = [os.path.join(output_folder, cat) for cat in categories]
+    if include_uncertain:
+        cache_dirs.append(os.path.join(output_folder, "uncertain"))
+    if os.path.exists(json_path) and all(os.path.isdir(path) for path in cache_dirs):
+        print(f"[CLIP] Using cached outputs: {json_path}")
+        return
+
     # ---------------------------------------------------------------------
     # Prepare destination folders
     # ---------------------------------------------------------------------
-    os.makedirs(output_folder, exist_ok=True)
     for cat in categories:
         path = os.path.join(output_folder, cat)
         if os.path.isdir(path):
@@ -345,7 +355,6 @@ def filter_with_clip(
     # ---------------------------------------------------------------------
     # Write scores JSON once at the end
     # ---------------------------------------------------------------------
-    json_path = os.path.join(output_folder, scores_json_name)
     try:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({

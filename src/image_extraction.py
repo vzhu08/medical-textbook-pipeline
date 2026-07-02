@@ -10,16 +10,17 @@ figure boxes via connected components on an adaptive-mean mask.
 
 Flow
 ----
-1) Ensure text JSONs exist:
+1) If final JSONs and output folders exist, reuse cached outputs.
+2) Ensure text JSONs exist:
    - If out_dir/text_struct.json and out_dir/text_boxes.json exist, reuse them.
    - Else call te.run_text_extraction(...) to produce text structure.
-2) Load compiled OCR rectangles:
+3) Load compiled OCR rectangles:
    - Prefer out_dir/paddle_compiled.json (xyxy → xywh per page).
    - If missing for a page, fall back to legacy out_dir/text_boxes_pages/pageNNN.json.
-3) Prepare output folders:
+4) Prepare output folders:
    - page_images/, page_masked/, page_mask/, page_bbox_overlay/, bbox_crops/,
      text_boxes_pages/, bbox_pages/
-4) For each page (threaded):
+5) For each page (threaded):
    a) Load page image
    b) Whitebox text regions (from compiled rectangles) with fast NumPy slicing
    c) Downscale to MASK_DET_LIMIT_SIDE for speed
@@ -28,7 +29,7 @@ Flow
    f) Scale boxes back to original space and save per-page JSON
    g) Save overlay (only in save_mode="all") and write crops (always)
    h) Record timings
-5) Save:
+6) Save:
    - out_dir/bboxes.json         : {page_key: [[x,y,w,h], ...]}
    - out_dir/manifest.json       : per-page timings, crop manifest, averages
 
@@ -48,6 +49,7 @@ Public API
 
 Notes
 -----
+- Existing bboxes.json, manifest.json, bbox_pages/, and bbox_crops/ are treated as complete stage outputs.
 - Whiteboxing prefers paddle_compiled.json; legacy per-page entries are a fallback.
 - Adaptive threshold is inverted so figures are white for CC detection.
 - Crops are upscaled so the shorter side is at least CROP_MIN_SIDE.
@@ -484,6 +486,31 @@ def run_image_extraction(
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
+    bboxes_path = os.path.join(out_dir, "bboxes.json")
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    bbox_pages_dir = os.path.join(out_dir, "bbox_pages")
+    crops_dir = os.path.join(out_dir, "bbox_crops")
+    if (
+        os.path.exists(bboxes_path)
+        and os.path.exists(manifest_path)
+        and os.path.isdir(bbox_pages_dir)
+        and os.path.isdir(crops_dir)
+    ):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            pages_count = int((manifest.get("timings") or {}).get("pages_count") or len(manifest.get("pages", {})))
+        except Exception:
+            pages_count = 0
+        print(f"[IMAGES] Using cached outputs: {bboxes_path} and {manifest_path}")
+        return {
+            "bboxes_path": bboxes_path,
+            "manifest_path": manifest_path,
+            "pages": pages_count,
+            "workers": workers,
+            "source": "cached",
+        }
+
     # ---- Step 1+2: make sure text extraction ran and load its results ----
     _t_text = time.perf_counter()
 
@@ -587,17 +614,17 @@ def run_image_extraction(
     }
 
     # ---- Step 5: persist combined outputs ----
-    with open(os.path.join(out_dir, "bboxes.json"), "w", encoding="utf-8") as f:
+    with open(bboxes_path, "w", encoding="utf-8") as f:
         json.dump(combined_bboxes, f, indent=2)
 
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
     print(f"[IMAGES] Done: pages={len(page_keys)} workers={workers} save_mode={save_mode}")
 
     return {
-        "bboxes_path": os.path.join(out_dir, "bboxes.json"),
-        "manifest_path": os.path.join(out_dir, "manifest.json"),
+        "bboxes_path": bboxes_path,
+        "manifest_path": manifest_path,
         "pages": len(page_keys),
         "workers": workers,
     }

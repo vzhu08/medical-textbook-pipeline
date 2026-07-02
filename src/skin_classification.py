@@ -11,12 +11,13 @@ GPU is optional.
 
 Flow
 ----
-1) run_segmentation_abd:
+1) If skin_tones.csv and fallbacks.csv both exist, reuse cached outputs.
+2) run_segmentation_abd:
    - Load UNet checkpoint.
    - Predict per-pixel probabilities and threshold to masks.
    - GPU path: single process, batched, mixed precision.
    - CPU path: single or multi-process. Option to save prob maps.
-2) run_postprocessing:
+3) run_postprocessing:
    - If prob map exists and CRF is enabled, refine with DenseCRF.
    - If refined mask covers < FALLBACK_MIN_COVERAGE_FRAC, use HSV fallback.
    - Cleanup: drop tiny components and shave mask border.
@@ -24,7 +25,7 @@ Flow
    - Update skin_tones.csv and fallbacks.csv (merged with existing rows).
      skin_tones.csv columns (extended):
        filename, skin_tint_0_100, rep_L, rep_a, rep_b, ITA, monk_tone
-3) classify_skin:
+4) classify_skin:
    - Orchestrate segmentation + postprocessing with worker resolution.
 
 Outputs
@@ -47,6 +48,7 @@ Notes
 -----
 - Mixed precision (torch.amp.autocast) is used only on CUDA.
 - DenseCRF settings favor edge adherence with gentle smoothing.
+- Existing skin_tones.csv and fallbacks.csv are treated as complete stage outputs.
 - Workers disable OpenCV inner threads; BLAS threads are pinned low.
 - KMeans uses n_init='auto' when available, else falls back to n_init=10.
 """
@@ -899,6 +901,12 @@ def classify_skin(
 ) -> None:
     for sub in ['masks','masked','clusters','rep_color'] + (['probs'] if use_crf else []):
         os.makedirs(os.path.join(output_dir, sub), exist_ok=True)
+
+    tones_csv = os.path.join(output_dir, 'skin_tones.csv')
+    fallbacks_csv = os.path.join(output_dir, 'fallbacks.csv')
+    if os.path.exists(tones_csv) and os.path.exists(fallbacks_csv):
+        print(f"[SKIN] Using cached outputs: {tones_csv} and {fallbacks_csv}")
+        return
 
     # Compute cap = max(cpu-2, 1)
     cpu = os.cpu_count() or 1

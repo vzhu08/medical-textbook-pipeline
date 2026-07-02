@@ -22,7 +22,7 @@ MODEL = "gpt-5-nano"          # fixed per your request
 BATCH_SIZE = 10               # max items per API call
 
 # --- Storage locations (literal strings) ---
-OUT_DIR = r"data/LLM Tests"   # relative to your current working directory
+OUT_DIR = r"../data/LLM Tests"  # relative to your current working directory
 OUT_NAME = "race_mentions"    # base filename
 
 # ensure directory exists

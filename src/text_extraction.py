@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -299,47 +300,71 @@ def _insert_ocr_as_invisible_text(src_pdf: str,
                                   image_sizes: List[Tuple[int, int]],
                                   ppjson_pages: List[Dict[str, Any]]) -> str:
     """
-    Create a new PDF with invisible text added at OCR line boxes.
+    Add invisible OCR text to the PDF and replace the original file in place.
     """
+    src_path = Path(src_pdf)
+    tmp_path = None
     doc = fitz.open(src_pdf)
 
-    for i, page in enumerate(doc):
-        Wpx, Hpx = image_sizes[i]
-        Wpt, Hpt = page.rect.width, page.rect.height
-        sx = Wpt / float(Wpx if Wpx > 0 else 1)
-        sy = Hpt / float(Hpx if Hpx > 0 else 1)
+    try:
+        for i, page in enumerate(doc):
+            Wpx, Hpx = image_sizes[i]
+            Wpt, Hpt = page.rect.width, page.rect.height
+            sx = Wpt / float(Wpx if Wpx > 0 else 1)
+            sy = Hpt / float(Hpx if Hpx > 0 else 1)
 
-        d = ppjson_pages[i]
-        ocr = d.get("overall_ocr_res") or {}
-        texts = ocr.get("rec_texts") or []
-        boxes = ocr.get("rec_boxes") or []
+            d = ppjson_pages[i]
+            ocr = d.get("overall_ocr_res") or {}
+            texts = ocr.get("rec_texts") or []
+            boxes = ocr.get("rec_boxes") or []
 
-        for txt, bb in zip(texts, boxes):
-            if not isinstance(bb, (list, tuple)) or len(bb) != 4:
-                continue
+            for txt, bb in zip(texts, boxes):
+                if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                    continue
 
-            x0, y0, x1, y1 = bb
-            if x1 <= x0 or y1 <= y0:
-                x, y, w, h = x0, y0, x1, y1
-                x0, y0, x1, y1 = x, y, x + w, y + h
+                x0, y0, x1, y1 = bb
+                if x1 <= x0 or y1 <= y0:
+                    x, y, w, h = x0, y0, x1, y1
+                    x0, y0, x1, y1 = x, y, x + w, y + h
 
-            rx0, ry0 = float(x0) * sx, float(y0) * sy
-            rx1, ry1 = float(x1) * sx, float(y1) * sy
-            rect = fitz.Rect(rx0, ry0, rx1, ry1)
+                rx0, ry0 = float(x0) * sx, float(y0) * sy
+                rx1, ry1 = float(x1) * sx, float(y1) * sy
+                rect = fitz.Rect(rx0, ry0, rx1, ry1)
 
-            page.insert_textbox(
-                rect,
-                txt,
-                fontname="helv",
-                fontsize=9,
-                render_mode=3,   # invisible text
-                overlay=True,
-            )
+                page.insert_textbox(
+                    rect,
+                    txt,
+                    fontname="helv",
+                    fontsize=9,
+                    render_mode=3,   # invisible text
+                    overlay=True,
+                )
 
-    out_pdf = str(Path(src_pdf).with_name("ocr_overlay.pdf"))
-    doc.save(out_pdf)
-    doc.close()
-    return out_pdf
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{src_path.stem}.ocr-overlay-",
+            suffix=src_path.suffix,
+            dir=str(src_path.parent),
+        )
+        os.close(fd)
+        os.remove(tmp_path)
+
+        try:
+            doc.save(tmp_path)
+        except Exception:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+    finally:
+        doc.close()
+
+    try:
+        os.replace(tmp_path, src_pdf)
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    return src_pdf
 
 
 # ---------------- Entries writers ----------------
@@ -509,8 +534,8 @@ def run_text_extraction(
     # Pass-1: plain PyMuPDF boxes
     total_boxes = _write_entries_from_pymupdf_blocks(pdf_path, entries_dir, image_sizes)
 
-    # If no boxes at all, OCR to create entries and an overlay PDF
-    overlay_pdf = pdf_path
+    # If no boxes at all, OCR to create entries and replace the PDF with an OCR-enhanced copy.
+    text_pdf = pdf_path
     source_flag = "pm4l"
 
     if total_boxes == 0:
@@ -524,7 +549,7 @@ def run_text_extraction(
         )
         _write_entries_from_ppjson(pp_pages, entries_dir)
 
-        overlay_pdf = _insert_ocr_as_invisible_text(
+        text_pdf = _insert_ocr_as_invisible_text(
             src_pdf=pdf_path,
             image_paths=image_paths,
             image_sizes=image_sizes,
@@ -534,7 +559,7 @@ def run_text_extraction(
 
     # Pass-2: PM4L for markdown + structure (+ index)
     pages = pymupdf4llm.to_markdown(
-        overlay_pdf,
+        text_pdf,
         page_chunks=True,
         extract_words=True,
         show_progress=True,

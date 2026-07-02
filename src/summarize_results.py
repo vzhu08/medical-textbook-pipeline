@@ -20,6 +20,7 @@
 #   text_analysis/gender_results.json                      # per_page gender counts
 #
 # Notes:
+#   - If image_dataset.csv, text_dataset.csv, and summary.txt exist, summarization is skipped.
 #   - CSVs are read as strings to avoid dtype issues.
 #   - Page number parsed from Photo_id like "0001_002.jpg" -> 1.
 #   - Book name fields parsed from input_dir basename "name_edition_year".
@@ -540,6 +541,13 @@ def summarize_results(input_dir: str, output_dir: str) -> None:
     """
     _ensure_dir(output_dir)
 
+    img_csv_path = os.path.join(output_dir, "image_dataset.csv")
+    txt_csv_path = os.path.join(output_dir, "text_dataset.csv")
+    summary_path = os.path.join(output_dir, "summary.txt")
+    if os.path.exists(img_csv_path) and os.path.exists(txt_csv_path) and os.path.exists(summary_path):
+        print(f"[SUMMARY] Using cached outputs: {img_csv_path}, {txt_csv_path}, and {summary_path}")
+        return
+
     # Parse book metadata and core counts
     book_name, edition_number, year = _parse_book_fields(input_dir)
     total_pages = _count_total_pages(input_dir)
@@ -549,8 +557,6 @@ def summarize_results(input_dir: str, output_dir: str) -> None:
     df_txt = _build_text_dataset(input_dir)
 
     # Write CSVs
-    img_csv_path = os.path.join(output_dir, "image_dataset.csv")
-    txt_csv_path = os.path.join(output_dir, "text_dataset.csv")
     df_img.to_csv(img_csv_path, index=False, encoding="utf-8")
     df_txt.to_csv(txt_csv_path, index=False, encoding="utf-8")
 

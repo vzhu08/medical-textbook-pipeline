@@ -5,5 +5,4 @@
 /textbook_storage/
 /.idea/
 /.venv/
-/temp.py
-/test.py
+/testing/
