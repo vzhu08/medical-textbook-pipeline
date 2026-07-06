@@ -12,17 +12,14 @@ Flow
 ----
 1) If final JSONs and output folders exist, reuse cached outputs.
 2) Ensure text JSONs exist:
-   - If out_dir/text_struct.json and out_dir/text_boxes.json exist, reuse them.
-   - Else call te.run_text_extraction(...) to produce text structure.
-3) Load compiled OCR rectangles:
-   - Prefer out_dir/paddle_compiled.json (xyxy → xywh per page).
-   - If missing for a page, fall back to legacy out_dir/text_boxes_pages/pageNNN.json.
+   - Call te.run_text_extraction(...) to produce text structure and per-page text boxes.
+3) Load per-page text rectangles from out_dir/text_boxes_pages/pageNNN.json.
 4) Prepare output folders:
    - page_images/, page_masked/, page_mask/, page_bbox_overlay/, bbox_crops/,
      text_boxes_pages/, bbox_pages/
 5) For each page (threaded):
    a) Load page image
-   b) Whitebox text regions (from compiled rectangles) with fast NumPy slicing
+   b) Whitebox text regions with fast NumPy slicing
    c) Downscale to MASK_DET_LIMIT_SIDE for speed
    d) Build mask with adaptive mean (binary INV) and one small dilation
    e) Connected components with gates and de-dup to get boxes
@@ -50,7 +47,7 @@ Public API
 Notes
 -----
 - Existing bboxes.json, manifest.json, bbox_pages/, and bbox_crops/ are treated as complete stage outputs.
-- Whiteboxing prefers paddle_compiled.json; legacy per-page entries are a fallback.
+- Whiteboxing uses text_boxes_pages/pageNNN.json. compiled_text_boxes.json is an inspection artifact from text extraction.
 - Adaptive threshold is inverted so figures are white for CC detection.
 - Crops are upscaled so the shorter side is at least CROP_MIN_SIDE.
 - CPU BLAS threads are pinned to 1; OpenCV threads disabled.
@@ -265,6 +262,44 @@ def save_crops(page_img: np.ndarray, boxes: List[Tuple[int, int, int, int]], out
     return crops_meta
 
 
+def _load_text_entries(entries_json_path: str) -> List[Dict[str, Any]]:
+    """Load per-page text boxes in either supported per-page JSON shape."""
+    if not os.path.exists(entries_json_path):
+        return []
+
+    try:
+        with open(entries_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    if isinstance(data, dict) and "entries" in data:
+        return [e for e in data["entries"] if isinstance(e, dict) and "rect" in e]
+    if isinstance(data, list):
+        return [e for e in data if isinstance(e, dict) and "rect" in e]
+    return []
+
+
+def _load_bbox_page_boxes(bbox_json_path: str) -> List[List[int]]:
+    """Load saved page boxes from bbox_pages/pageNNN.json."""
+    with open(bbox_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    boxes: List[List[int]] = []
+    for e in data if isinstance(data, list) else []:
+        rect = e.get("rect") if isinstance(e, dict) else None
+        if isinstance(rect, (list, tuple)) and len(rect) == 4:
+            boxes.append([int(v) for v in rect])
+    return boxes
+
+
+def _crop_manifest_from_boxes(pk: str, boxes_xywh: List[List[int]]) -> List[Dict[str, Any]]:
+    """Rebuild deterministic crop metadata from saved boxes."""
+    return [
+        {"rect": [int(v) for v in box], "file": crop_name(pk, idx)}
+        for idx, box in enumerate(boxes_xywh, start=1)
+    ]
+
+
 # ---------------------------
 # Main per-page worker
 # ---------------------------
@@ -274,8 +309,7 @@ def _process_one_page(
     out_dir: str,
     dirs: Dict[str, str],
     save_mode: str,
-    compiled_rects_xywh: Optional[Dict[str, List[List[int]]]] = None,
-) -> Tuple[str, List[Dict[str, Any]], List[List[int]], List[Dict[str, Any]], Dict[str, float]]:
+) -> Tuple[str, List[Dict[str, Any]], List[List[int]], List[Dict[str, Any]], Dict[str, Any]]:
     """
     Process one page:
       1) load page image
@@ -285,7 +319,7 @@ def _process_one_page(
       5) persist artifacts without re-doing work if files already exist
     """
     t0_all = time.perf_counter()
-    timings: Dict[str, float] = {
+    timings: Dict[str, Any] = {
         "image_load_s": 0.0,
         "adaptive_mask_s": 0.0,
         "bbox_cropping_s": 0.0,
@@ -303,11 +337,12 @@ def _process_one_page(
     # Fast skip when we already have boxes and the source page image
     if os.path.exists(bbox_json_path) and os.path.exists(page_img_path):
         try:
-            with open(bbox_json_path, "r", encoding="utf-8") as f:
-                prev = json.load(f)
-            boxes_xywh = [e["rect"] for e in prev if isinstance(e, dict) and "rect" in e]
+            boxes_xywh = _load_bbox_page_boxes(bbox_json_path)
+            entries = _load_text_entries(entries_json_path)
+            crops_meta = _crop_manifest_from_boxes(pk, boxes_xywh)
+            timings["cached_page"] = True
             timings["total_page_s"] = time.perf_counter() - t0_all
-            return pk, [], boxes_xywh, [], timings
+            return pk, entries, boxes_xywh, crops_meta, timings
         except Exception:
             pass
 
@@ -321,23 +356,9 @@ def _process_one_page(
 
     H, W = page_img.shape[:2]
 
-    # ---------- entries: load from per-page json or compiled dict ----------
+    # ---------- entries: load from per-page json ----------
     # Expected format per entry: {"rect": [x, y, w, h], ...}
-    entries: List[Dict[str, Any]] = []
-
-    if os.path.exists(entries_json_path):
-        try:
-            with open(entries_json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # Accept either a list[{"rect":[...]}] or {"entries":[...]}
-            if isinstance(data, dict) and "entries" in data:
-                entries = [e for e in data["entries"] if isinstance(e, dict) and "rect" in e]
-            elif isinstance(data, list):
-                entries = [e for e in data if isinstance(e, dict) and "rect" in e]
-        except Exception:
-            entries = []
-    elif compiled_rects_xywh and pk in compiled_rects_xywh:
-        entries = [{"rect": rect} for rect in compiled_rects_xywh[pk] if isinstance(rect, (list, tuple)) and len(rect) == 4]
+    entries = _load_text_entries(entries_json_path)
 
     # ---------- whitebox using entries ----------
     # Uses your existing whitebox_text(page_img, entries) if present.
@@ -473,7 +494,7 @@ def run_image_extraction(
     """
     Image pass (assumes text pass already writes entries):
       a) Ensure text extraction bundle is available; read per-page structure.
-      b) Whitebox using <out_dir>/text_boxes_pages/pageNNN.json (or compiled_rects_xywh if present).
+      b) Whitebox using <out_dir>/text_boxes_pages/pageNNN.json.
       c) Adaptive-mean mask (in-memory B/W) -> bbox detection.
       d) Persist per-page and combined outputs, skipping files that already exist.
 
@@ -552,28 +573,20 @@ def run_image_extraction(
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
 
-    # Optional compiled rectangles (e.g., from Paddle structure), used for whiteboxing if present.
-    compiled_rects_xywh: Dict[str, List[List[int]]] = {}
-    compiled_path = os.path.join(out_dir, "paddle_compiled.json")
-    if os.path.exists(compiled_path):
-        try:
-            with open(compiled_path, "r", encoding="utf-8") as f:
-                compiled = json.load(f)
-            for pk, payload in compiled.items():
-                rects = []
-                for it in payload.get("items", []):
-                    b = it.get("bbox_xyxy")
-                    if isinstance(b, list) and len(b) == 4:
-                        x1, y1, x2, y2 = [int(v) for v in b]
-                        rects.append([x1, y1, max(1, x2 - x1), max(1, y2 - y1)])
-                if rects:
-                    compiled_rects_xywh[pk] = rects
-            print(f"[IMAGES] Using paddle_compiled.json for whiteboxing ({len(compiled_rects_xywh)} pages)")
-        except Exception as e:
-            print(f"[IMAGES] Failed to parse paddle_compiled.json: {e}")
-
     # ---- Step 4: run per-page processing (whitebox -> adaptive mean -> bboxes) ----
     page_keys = sorted(structure.keys())
+    missing_entries = [
+        pk for pk in page_keys
+        if not os.path.isfile(os.path.join(entries_dir, f"{pk}.json"))
+    ]
+    if missing_entries:
+        preview = ", ".join(missing_entries[:10])
+        extra = "" if len(missing_entries) <= 10 else f", ... ({len(missing_entries)} pages total)"
+        raise FileNotFoundError(
+            f"Missing text_boxes_pages JSON for {preview}{extra}. "
+            "Rerun text extraction or remove stale extracted_images outputs."
+        )
+
     if workers is None:
         workers = max(1, (os.cpu_count() or 4) - 2)
 
@@ -585,7 +598,7 @@ def run_image_extraction(
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [
-            ex.submit(_process_one_page, pk, out_dir, dirs, save_mode, compiled_rects_xywh)
+            ex.submit(_process_one_page, pk, out_dir, dirs, save_mode)
             for pk in page_keys
         ]
         for fut in as_completed(futs):

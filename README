@@ -1,5 +1,12 @@
 Work in progress pipeline for dermatology textbook photograph race identification
 
+Ignore the rest of this file and refer to the reproducibility report for in-depth documentation and setup instructions.
+
+
+
+
+
+
 Please import requirements.txt before using
 
 If running PaddleOCR with GPU, install all Paddle dependencies first then torch. Ensure correct CUDA wheel.

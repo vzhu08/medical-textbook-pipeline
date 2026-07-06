@@ -2,24 +2,27 @@
 
 ## Reproducibility Report
 
-This report explains the current dermatology textbook pipeline to provide full documentation for accurate reproducibility. It also mentions potential issues and areas for improvement. It is based on the repository files in this project, especially `main.py` and the modules in `src/`.
+This report explains the current medical textbook pipeline to provide full documentation for accurate reproducibility. It also mentions potential issues and areas for improvement. It is based on the repository files in this project, especially `main.py` and the modules in `src/`.
 
-The goal of the pipeline is to turn dermatology textbook PDFs into research artifacts about representation in images and text. It extracts page text and figure crops, filters the crops with CLIP, estimates visible skin tone on skin-containing photographs, uses an OpenAI model to count explicit race and gender mentions in the extracted text, and then compiles final CSV datasets and summary plots.
+The goal of the pipeline is to turn medical textbook PDFs into research artifacts about representation in images and text. It extracts page text and figure crops, filters the crops with CLIP, estimates visible skin tone on skin-containing photographs, uses an OpenAI model to count explicit race and gender mentions in the extracted text, and then compiles final CSV datasets and summary plots.
 
+This project is still very much work in progress, and the accuracy of certain modules could certainly be improved. New functionality, such as the classification of illustrations, would likely be helpful for downstream analysis.
+
+For any questions regarding this report or the repository, contact Vincent Zhu at vzhu08@gmail.com or 610-808-7989.
 ## Table of Contents
 
-| Section | What it explains |
-|---|---|
-| [1. Introduction and Overview](#1-introduction-and-overview) | The purpose of the pipeline, its major stages, its module split, the expected input/output file structure, and the subprocess design. |
+| Section | What it explains                                                                                                                                        |
+|---|---------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [1. Introduction and Overview](#1-introduction-and-overview) | The purpose of the pipeline, its major stages, its module split, the expected input/output file structure, and the subprocess design.                   |
 | [2. Prerequisites and Setup](#2-prerequisites-and-setup) | The Python environment, required packages, external models, API keys, PDF naming convention, and basic setup checks needed before running the pipeline. |
-| [3. Running the Pipeline](#3-running-the-pipeline) | The main command, current `main.py` configuration flags, and what the default versus complete run does. |
-| [4. Module-by-Module Reproducibility Guide](#4-module-by-module-reproducibility-guide) | The detailed step-by-step behavior of each pipeline module, including tools used, inputs, outputs, validation steps, and caveats. |
-| [5. Safe Reruns and Cache Invalidation](#5-safe-reruns-and-cache-invalidation) | How cached artifacts behave and which folders to remove when rerunning changed stages. |
-| [6. Known Issues and Risks](#6-known-issues-and-risks) | Current technical, reproducibility, and methodological risks that should be understood before using results. |
-| [7. Troubleshooting](#7-troubleshooting) | Common failure modes and practical checks for missing PDFs, dependency problems, model downloads, API failures, and empty outputs. |
-| [8. Reproducibility Checklist](#8-reproducibility-checklist) | The run metadata, files, model versions, manual reviews, and validation checks to record before accepting a run as reproducible. |
-| [9. Handoff Checklist for the Next RA](#9-handoff-checklist-for-the-next-ra) | The materials, notes, credentials guidance, outputs, and review records to provide to the next research assistant. |
-| [10. Recommended Next Development Priorities](#10-recommended-next-development-priorities) | Suggested improvements for making the pipeline easier to configure, rerun, validate, and maintain. |
+| [3. Running the Pipeline](#3-running-the-pipeline) | The main command, default `main.py` configuration flags, and what each flag does.                                                                       |
+| [4. Module-by-Module Guide](#4-module-by-module-guide) | The detailed step-by-step behavior of each pipeline module, including tools used, inputs, outputs, validation steps, and caveats.                       |
+| [5. Safe Reruns and Cache Invalidation](#5-safe-reruns-and-cache-invalidation) | How cached artifacts behave and which folders to remove when rerunning changed stages.                                                                  |
+| [6. Known Issues and Risks](#6-known-issues-and-risks) | Current technical, reproducibility, and methodological risks that should be understood before using results.                                            |
+| [7. Troubleshooting](#7-troubleshooting) | Common failure modes and practical checks for missing PDFs, dependency problems, model downloads, API failures, and empty outputs.                      |
+| [8. Reproducibility Checklist](#8-reproducibility-checklist) | The run metadata, files, model versions, manual reviews, and validation checks to record before accepting a run as reproducible.                        |
+| [9. Handoff Checklist for the Next RA](#9-handoff-checklist-for-the-next-ra) | The materials, notes, credentials guidance, outputs, and review records to provide to the next research assistant.                                      |
+| [10. Recommended Next Development Priorities](#10-recommended-next-development-priorities) | Suggested improvements for making the pipeline easier to configure, rerun, validate, and maintain.                                                      |
 
 ## 1. Introduction and Overview
 
@@ -36,9 +39,7 @@ For every PDF in `textbook_inputs/`, `main.py` creates a textbook-specific works
 7. Use an OpenAI model to identify explicit race and gender mentions in textbook text.
 8. Compile final image and text datasets, plots, and summary statistics.
 
-The pipeline is artifact-driven. Modules communicate mostly by reading and writing files on disk rather than passing large Python objects in memory. This makes it easier to inspect intermediate results and rerun individual stages, but it also means stale cached files can affect later runs.
-
-### 1.3 Module Split
+### 1.2 Module Split
 
 The repository is organized around one orchestration script and six main pipeline modules:
 
@@ -54,12 +55,12 @@ The repository is organized around one orchestration script and six main pipelin
 
 `src/__init__.py` is empty and only marks `src` as a Python package.
 
-### 1.4 File Structure
+### 1.3 File Structure
 
 Before running the pipeline, the project should look like this:
 
 ```text
-dermatology-pipeline/
+medical-textbook-pipeline/
 |-- main.py
 |-- README
 |-- requirements.txt
@@ -146,13 +147,15 @@ data/fitzpatrick_9th_2023/
 
 Some folders are created even when a stage is disabled or produces no records.
 
+### 1.4 Artifact + Cache Design
+
+The pipeline is artifact-driven. Modules communicate mostly by reading and writing files on disk rather than passing large Python objects in memory. This makes it easier to inspect intermediate results and rerun individual stages, but it also means stale cached files can affect later runs. When changing settings or code, manually delete outputs from past runs to ensure accurate new outputs.
+
 ### 1.5 Subprocess Design
 
 `main.py` runs each heavy stage in a fresh Python subprocess using `_run_stage_subprocess(...)`. The parent process writes function arguments to a temporary JSON file, starts a clean Python interpreter, imports the relevant module, and calls the module entry point.
 
-This design helps release GPU and model memory between stages and reduces conflicts between PyTorch, PaddleOCR, OpenCV, and Transformers. It also means that each stage must get all required inputs from function arguments, environment variables, and files on disk.
-
-The setup is rather clunky, but it was necessary to solve certain conflicts between PyTorch and PaddleOCR. There may be a cleaner solution.
+This design is rather clunky, but it was necessary to solve certain conflicts between PyTorch and PaddleOCR. There may be a cleaner solution.
 
 ## 2. Prerequisites and Setup
 
@@ -166,10 +169,11 @@ The packages used in this pipeline must be installed in a very specific order to
 
 1. Create and activate a clean virtual environment.
 2. Install the correct PaddlePaddle 3.1.0 build for the machine. Locate correct command at: https://www.paddlepaddle.org.cn/install/old?docurl=/documentation/docs/zh/develop/install/pip/windows-pip.html
-3. Run `pip install paddleocr[all]`.
-4. Install the correct PyTorch build for the machine.
-5. Install remaining requirements from `requirements.txt`.
-6. Ensure GPU availability on the machine
+3. If the PaddlePaddle install page gives a newer default command, adjust it to install version 3.1.0.
+4. Run `pip install paddleocr[all]`.
+5. Install the correct PyTorch build for the machine.
+6. Install remaining requirements from `requirements.txt`.
+7. Ensure GPU availability on the machine
 
 The current `requirements.txt` lists:
 
@@ -205,8 +209,7 @@ The skin-classification stage expects the ABD skin-segmentation checkpoint here:
 ```text
 models/abd-skin-segmentation/final_unet_pytorch.pth
 ```
-
-You can download it here: https://github.com/MRE-Lab-UMD/abd-skin-segmentation/blob/master/Models/final_unet_pytorch.pth
+The correct model is already in the repo, but you can download it here: https://github.com/MRE-Lab-UMD/abd-skin-segmentation/blob/master/Models/final_unet_pytorch.pth
 
 ### 2.4 Input PDFs and Naming Convention
 
@@ -252,7 +255,7 @@ On Windows, use the virtual environment's Python executable if `python` does not
 .\.venv\Scripts\python.exe main.py
 ```
 
-### 3.2 Current `main.py` Flags
+### 3.2 Default `main.py` Flags
 
 The pipeline is controlled by constants near the top of `main.py`. There is no command-line interface yet.
 
@@ -272,9 +275,30 @@ The pipeline is controlled by constants near the top of `main.py`. There is no c
 
 The pipeline is currently intended to run without `RUN_FILTER_RACE` as it does not produce accurate results.
 
-## 4. Module-by-Module Reproducibility Guide
+## 4. Module-by-Module Guide
+Each section hear explains each module in detail, providing:
+- The flag to enable/disable it
+- The main function
+- Purpose
+- Tools and libraries used
+- Inputs and outputs
+- Step-by-step behavior
+- Cache behavior
+- Files to validate when checking for accuracy
+- Any worthwhile notes
 
-### 4.1 Pipeline Orchestration in `main.py`
+### 4.1 Pipeline Orchestration - `main()` and `process_pdf(pdf_path)`
+
+Runs when:
+
+- The user runs `python main.py` from the repository root.
+
+Main functions:
+
+```python
+main()
+process_pdf(pdf_path: str)
+```
 
 Purpose:
 
@@ -284,7 +308,7 @@ Inputs:
 
 - `textbook_inputs/*.pdf`
 - stage flags and constants defined near the top of `main.py`
-- environment variables needed by child modules, especially `OPENAI_API_KEY`
+- environment variables needed by child modules, namely `OPENAI_API_KEY`
 - model files under `models/`
 
 Outputs:
@@ -320,20 +344,29 @@ Notes:
 
 ### 4.2 Module 1: Text Extraction - `src.text_extraction.run_text_extraction(...)`
 
-Purpose:
+Runs when:
 
-This module renders PDF pages, extracts page text boxes, creates page-structured Markdown, and prepares text boxes used by image extraction.
-
-Called by:
-
-- `src/image_extraction.run_image_extraction(...)`
-- indirectly by `main.py` when `RUN_EXTRACTION=True`
+- `RUN_EXTRACTION=True`, as part of the image-extraction stage.
+- Direct call path: `main.py` calls `src.image_extraction.run_image_extraction(...)`, which calls `src.text_extraction.run_text_extraction(...)`.
 
 Main function:
 
 ```python
-run_text_extraction(pdf_path, out_dir, device="gpu", ...)
+run_text_extraction(
+    pdf_path: str,
+    out_dir: str,
+    device: str = "gpu",
+    *,
+    det_limit_side_len: int = DET_LIMIT_SIDE_LEN,
+    det_box_thresh: float = DET_BOX_THRESH,
+    rec_score_thresh: float = REC_SCORE_THRESH,
+    rec_batch: int = REC_BATCH,
+) -> Dict[str, Any]
 ```
+
+Purpose:
+
+This module renders PDF pages, extracts page text boxes, creates page-structured Markdown, and prepares text boxes used by image extraction.
 
 Tools and libraries:
 
@@ -391,19 +424,25 @@ Notes:
 
 ### 4.3 Module 2: Image Extraction - `src.image_extraction.run_image_extraction(...)`
 
-Purpose:
+Runs when:
 
-This module finds likely figure regions on each rendered page and saves them as image crops.
-
-Called by:
-
-- `main.py` stage 1 when `RUN_EXTRACTION=True`
+- `RUN_EXTRACTION=True`.
 
 Main function:
 
 ```python
-run_image_extraction(pdf_path, out_dir, device="gpu", workers=None, save_mode="final")
+run_image_extraction(
+    pdf_path: str,
+    out_dir: str,
+    device: str = "gpu",
+    workers: Optional[int] = None,
+    save_mode: str = "final",
+) -> Dict[str, Any]
 ```
+
+Purpose:
+
+This module finds likely figure regions on each rendered page and saves them as image crops.
 
 Tools and libraries:
 
@@ -433,15 +472,15 @@ Step-by-step behavior:
    - `text_boxes_pages/`
    - `bbox_pages/`
 5. For each page, load `page_images/pageNNN.jpg`.
-6. Load text boxes from `text_boxes_pages/pageNNN.json`. If absent, optionally use `paddle_compiled.json` if that file exists.
-7. Whitebox text regions by filling text rectangles with white.
+6. Load text boxes from `text_boxes_pages/pageNNN.json`.
+7. Whitebox text regions by filling text rectangles with white (this is meant to improve figure recognition by removing text noise).
 8. Downscale the page for faster detection if needed.
 9. Convert to grayscale and use adaptive thresholding to produce a binary mask.
 10. Run connected components and filter boxes by size, area fraction, aspect ratio, and near-duplicate overlap.
 11. Scale boxes back to full-resolution page coordinates.
 12. Write per-page boxes to `bbox_pages/pageNNN.json`.
 13. Save figure crops to `bbox_crops/` with names like `0001_002.jpg`.
-14. If `save_mode="all"`, also save whiteboxed pages, masks, and bbox overlays.
+14. If `save_mode="all"`, also save whiteboxed pages, masks, and bbox overlays (for validation and debug purposes).
 15. Write combined boxes to `bboxes.json` and page timing/crop metadata to `manifest.json`.
 
 Primary outputs:
@@ -463,7 +502,7 @@ extracted_images/page_bbox_overlay/
 
 Cache behavior:
 
-If `bboxes.json`, `manifest.json`, `bbox_pages/`, and `bbox_crops/` already exist, the module skips immediately and returns the cached artifact paths. If those combined outputs are missing, individual pages can still be skipped when `bbox_pages/pageNNN.json` and the rendered page image already exist.
+If `bboxes.json`, `manifest.json`, `bbox_pages/`, and `bbox_crops/` already exist, the module skips immediately and returns the cached artifact paths. If those combined outputs are missing, individual pages can still be skipped when `bbox_pages/pageNNN.json` and the rendered page image already exist; skipped pages reconstruct manifest text and crop metadata from existing artifacts and are marked with `cached_page: True`.
 
 Validation:
 
@@ -472,29 +511,40 @@ Validation:
 - Confirm crop filenames encode the page number correctly.
 - Check `manifest.json` for pages with zero crops or suspiciously high crop counts.
 
-Important caveats:
+Notes:
 
-- The module documentation mentions `paddle_compiled.json`, but the current text extractor writes `compiled_text_boxes.json`. Normal processing still uses `text_boxes_pages/pageNNN.json`, so extraction does not depend on `paddle_compiled.json`.
-- If `bbox_pages/pageNNN.json` already exists, that page is skipped and crop/text metadata in a regenerated `manifest.json` can be incomplete for skipped pages.
+- `compiled_text_boxes.json` is generated by text extraction for readability and auditing, but image extraction uses `text_boxes_pages/pageNNN.json` as the source of text boxes for whiteboxing.
+- `manifest.json` is also for readability and lists all crop locations.
 
 ### 4.4 Module 3: CLIP Filtering - `src.filter_with_clip.filter_with_clip(...)`
 
-Purpose:
+Runs when:
 
-This reusable module routes images into category folders using CLIP similarity to prompt lists.
-
-Called by:
-
-- `main.py` stage 2 for photo vs illustration vs text
-- `main.py` stage 3 for skin vs no-skin
-- `main.py` stage 4 for gender
-- `main.py` stage 5 for race
+- `RUN_FILTER_PHOTO=True` for stage 2, photo vs illustration vs text.
+- `RUN_FILTER_SKIN=True` for stage 3, skin vs no-skin.
+- `RUN_FILTER_GENDER=True` for stage 4, image gender routing.
+- `RUN_FILTER_RACE=True` for stage 5, image race routing.
 
 Main function:
 
 ```python
-filter_with_clip(input_folder, output_folder, categories, use_mean=False, ...)
+filter_with_clip(
+    input_folder: str,
+    output_folder: str,
+    categories: Dict[str, List[str]],
+    use_mean: bool = False,
+    batch_size: int = 32,
+    workers: int | None = None,
+    use_gpu: bool = True,
+    include_uncertain: bool = False,
+    uncertainty_threshold: float = 0.01,
+    scores_json_name: str = "clip_similarity_scores.json",
+)
 ```
+
+Purpose:
+
+This reusable module routes images into category folders using CLIP similarity to prompt lists. This lists can be found in `main.py` and were constructed over many trials of test runs. Accuracy can likely still be improved by adding/change/removing prompts from these lists.
 
 Tools and libraries:
 
@@ -546,6 +596,12 @@ Cache behavior:
 
 If the stage's `clip_similarity_scores.json` and expected category folders exist, the CLIP module returns before loading CLIP, clearing category folders, or copying images. Delete the relevant CLIP output folder to force rerouting.
 
+General notes:
+
+- Category folders are cleared before routing, but the optional `uncertain/` folder is created without clearing old files.
+- Prompt changes are only recorded in the overwritten score JSON.
+- The module assumes at least two categories because it compares top-1 and top-2 decisions.
+
 #### Stage 2: Photo vs Illustration vs Text
 
 Input:
@@ -566,7 +622,7 @@ Categories:
 - `illus`
 - `text`
 
-`main.py` uses `use_mean=True` for this stage. Downstream stages normally consume only:
+`main.py` uses `use_mean=True` for this stage. Downstream stages currently consume only:
 
 ```text
 sorted_images/photo_illus/photo/
@@ -575,7 +631,11 @@ sorted_images/photo_illus/photo/
 Validation:
 
 - Manually review a sample of all three folders.
-- Pay special attention to clinical illustrations, screenshots, tables, and partially photographic composite figures.
+- Pay special attention to clinical illustrations, tables, and designs like book covers.
+
+Notes:
+
+- Accuracy has been very high here, upwards of 95%
 
 #### Stage 3: Skin vs No-Skin
 
@@ -605,7 +665,10 @@ sorted_images/if_skin/skin/
 Validation:
 
 - Check microscopy, internal anatomy, medical equipment, and mouth/oral cavity images.
-- Review false negatives, because missed skin images never reach skin tone classification.
+
+Notes:
+
+- Accuracy is also high here, upwards of 90%
 
 #### Stage 4: Image Gender Routing
 
@@ -627,15 +690,19 @@ Categories:
 - `female`
 - `uncertain`
 
-`main.py` uses `include_uncertain=True` and `uncertainty_threshold=0.01`.
+`main.py` uses `use_mean=False` and `include_uncertain=True`.
 
 Validation:
 
 - Treat labels as putative and uncertain.
-- Review all `uncertain/` images and low-margin decisions.
+- Review `uncertain/` images and low-margin decisions.
 - Flag images where gender cannot reasonably be inferred from the crop.
 
-#### Stage 5: Putative Image Race Routing
+Notes:
+
+- Accuracy is surprisingly high here, around 75% for identifiable images.
+
+#### Stage 5: Image Race Routing
 
 Input:
 
@@ -657,35 +724,45 @@ Categories:
 - `latine`
 - `uncertain`
 
-`main.py` uses `include_uncertain=True` and `uncertainty_threshold=0.005`.
+`main.py` uses `use_mean=False` and `include_uncertain=True`.
 
 Validation:
 
-- Treat labels as CLIP prompt routes, not verified identity.
-- Review all `uncertain/` images and low-margin decisions.
-- Report limitations prominently in any analysis.
+- Review `uncertain/` images and low-margin decisions.
 
-Important CLIP caveats:
+Notes:
 
-- Category folders are cleared before routing, but the optional `uncertain/` folder is created without clearing old files.
-- Prompt changes are only recorded in the overwritten score JSON.
-- The module assumes at least two categories because it compares top-1 and top-2 decisions.
+- Accuracy is pretty abysmal here, less than 40% for identifiable images.
 
 ### 4.5 Module 4: Skin Tone Classification - `src.skin_classification.classify_skin(...)`
 
-Purpose:
+Runs when:
 
-This module segments visible skin, computes a representative skin color, calculates Individual Typology Angle (ITA), and maps ITA to a Monk Skin Tone category.
-
-Called by:
-
-- `main.py` stage 6 when `RUN_SKIN_CLASSER=True`
+- `RUN_SKIN_CLASSER=True`.
 
 Main function:
 
 ```python
-classify_skin(input_dir, output_dir, abd_model_path, ...)
+classify_skin(
+    input_dir: str,
+    output_dir: str,
+    abd_model_path: str,
+    *,
+    input_size: int = DEFAULT_INPUT_SIZE,
+    thr: float = DEFAULT_THRESH,
+    batch_size: int = DEFAULT_BATCH,
+    k: int = 5,
+    seg_workers: Optional[int] = None,
+    post_workers: Optional[int] = None,
+    workers: Optional[int] = None,
+    use_crf: bool = USE_CRF_DEFAULT,
+    use_gpu: bool = True,
+) -> None
 ```
+
+Purpose:
+
+This module segments visible skin, computes a representative skin color, calculates Individual Typology Angle (ITA), and maps ITA to a Monk Skin Tone category.
 
 Tools and libraries:
 
@@ -774,19 +851,27 @@ Important caveats:
 
 ### 4.6 Module 5: Text Analysis - `src.text_parser.analyze_text_llm(...)`
 
-Purpose:
+Runs when:
 
-This module counts explicit race and gender mentions in the extracted textbook text.
-
-Called by:
-
-- `main.py` stage 7 when `RUN_TEXT=True`
+- `RUN_TEXT=True`.
 
 Main function:
 
 ```python
-analyze_text_llm(input_dir, output_dir, cost_cap_usd=10.0, ...)
+analyze_text_llm(
+    input_dir: str,
+    output_dir: str,
+    *,
+    cost_cap_usd: float = 10.0,
+    verbose: bool = True,
+    save_batch_json: bool = True,
+    reuse_existing_outputs: bool = True,
+) -> Tuple[str, str, Dict[str, Any]]
 ```
+
+Purpose:
+
+This module counts explicit race and gender mentions in the extracted textbook text.
 
 Tools and services:
 
@@ -872,19 +957,19 @@ Important caveats:
 
 ### 4.7 Module 6: Summarization - `src.summarize_results.summarize_results(...)`
 
-Purpose:
+Runs when:
 
-This module creates final research-facing datasets and summary plots for one textbook folder.
-
-Called by:
-
-- `main.py` stage 8 when `RUN_SUMMARIZE=True`
+- `RUN_SUMMARIZE=True`.
 
 Main function:
 
 ```python
-summarize_results(input_dir, output_dir)
+summarize_results(input_dir: str, output_dir: str) -> None
 ```
+
+Purpose:
+
+This module creates final research-facing datasets and summary plots for one textbook folder.
 
 Tools and libraries:
 
@@ -997,7 +1082,7 @@ Text extraction cache:
 Image extraction cache:
 
 - Reuses the whole module when `bboxes.json`, `manifest.json`, `bbox_pages/`, and `bbox_crops/` exist.
-- If the combined outputs are missing, individual pages can still be skipped when `bbox_pages/pageNNN.json` and the page image already exist.
+- If the combined outputs are missing, individual pages can still be skipped when `bbox_pages/pageNNN.json` and the page image already exist. Skipped pages reconstruct manifest metadata from existing text boxes and deterministic crop filenames.
 - Delete `bbox_pages/`, `bbox_crops/`, `bboxes.json`, and `manifest.json` after changing detection settings or source page/text artifacts.
 
 CLIP cache:
@@ -1025,23 +1110,20 @@ Summary cache:
 
 ## 6. Known Issues and Risks
 
-1. `requirements.txt` is incomplete. Add `pandas`, `Pillow`, `scikit-learn`, `openai`, and `python-dotenv`.
-2. Most package versions are not pinned.
-3. There is no command-line or config-file interface; stage flags are edited in `main.py`.
-4. The default run is incomplete for full demographic analysis.
-5. Cache validity is based mainly on file existence.
-6. OCR only runs when the whole PDF has zero native text boxes.
-7. OCR replaces scanned input PDFs in place with OCR-enhanced copies, so preserve raw originals separately when needed.
-8. `image_extraction.py` looks for optional `paddle_compiled.json`, but `text_extraction.py` writes `compiled_text_boxes.json`.
-9. Skipped image-extraction pages can lead to incomplete regenerated manifest metadata.
-10. CLIP `uncertain/` folders may retain stale files.
-11. Summarization may succeed with empty or incomplete upstream artifacts.
-12. `summarize_results.py` reads some skin-tone CSV fields by column position.
-13. OpenAI pricing is hard-coded and may become outdated.
-14. OpenAI cost caps can be exceeded by concurrent requests.
-15. Persistent rate limits may cause repeated text-analysis resubmissions.
-16. There is no automated test suite.
-17. Ethical and validity risks are substantial for image-based demographic labels.
+1. Most package versions are not pinned.
+2. There is no command-line or config-file interface; stage flags are edited in `main.py`.
+3. The default run is incomplete for full demographic analysis.
+4. Cache validity is based mainly on file existence.
+5. OCR only runs when the whole PDF has zero native text boxes.
+6. OCR replaces scanned input PDFs in place with OCR-enhanced copies, so preserve raw originals separately when needed.
+7. CLIP `uncertain/` folders may retain stale files.
+8. Summarization may succeed with empty or incomplete upstream artifacts.
+9. `summarize_results.py` reads some skin-tone CSV fields by column position.
+10. OpenAI pricing is hard-coded and may become outdated.
+11. OpenAI cost caps can be exceeded by concurrent requests.
+12. Persistent rate limits may cause repeated text-analysis resubmissions.
+13. There is no automated test suite.
+14. Ethical and validity risks are substantial for image-based demographic labels.
 
 ## 7. Troubleshooting
 
