@@ -10,6 +10,8 @@ Many of the methods used in this pipeline, especially the skin segmentation and 
 
 This project is still very much a work in progress, and the accuracy of certain modules could certainly be improved. New functionality, such as the classification of illustrations, would likely be helpful for downstream analysis.
 
+This document is rather lengthy. To get a general idea of the pipelines functionality, skim over section 4, mainly reading the purpose and step-by-step behavior sections. Refer to section 2 for setting up the pipeline.
+
 For any questions regarding this report or the repository, contact Vincent Zhu at vzhu08@gmail.com or 610-808-7989.
 
 ## Table of Contents
