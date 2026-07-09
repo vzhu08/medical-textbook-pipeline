@@ -4,8 +4,9 @@ src/filter_with_clip.py
 Purpose
 -------
 Classify images into category subfolders using CLIP and write a single JSON of
-similarity and decision scores in the output root. Optional "uncertain" bucket
-routes files whose top-1 vs top-2 decision margin is below a threshold.
+similarity and decision scores in the output root plus timestamped historical
+snapshots. Optional "uncertain" bucket routes files whose top-1 vs top-2
+decision margin is below a threshold.
 
 Flow
 ----
@@ -21,13 +22,16 @@ Flow
    - apply uncertainty test on decision scores; route if needed
    - copy image to destination subfolder
    - record per-image details for JSON
-6) Write output_folder/clip_similarity_scores.json with scores and routing.
+6) Write output_folder/clip_similarity_scores.json with scores and routing,
+   plus a timestamped copy under output_folder/clip_similarity_scores_runs/.
 
 Outputs
 -------
 - output_folder/<category>/        : routed images
 - output_folder/uncertain/         : optional, if include_uncertain=True
 - output_folder/clip_similarity_scores.json : all per-image scores and decisions
+- output_folder/clip_similarity_scores_runs/clip_similarity_scores_<run_id>.json
+                                      : timestamped historical score snapshots
 
 Access point
 ----------
@@ -61,6 +65,7 @@ import multiprocessing
 from contextlib import nullcontext
 from typing import Dict, List, Tuple
 from threading import Lock
+from datetime import datetime, timezone
 
 # Prefer higher matmul perf on recent NVIDIA GPUs; safe no-op elsewhere.
 try:
@@ -179,8 +184,12 @@ def filter_with_clip(
     # ---------------------------------------------------------------------
     # Prepare destination folders
     # ---------------------------------------------------------------------
-    for cat in categories:
-        path = os.path.join(output_folder, cat)
+    dest_folders = [os.path.join(output_folder, cat) for cat in categories]
+    uncertain_folder = os.path.join(output_folder, "uncertain") if include_uncertain else None
+    if include_uncertain:
+        dest_folders.append(uncertain_folder)
+
+    for path in dest_folders:
         if os.path.isdir(path):
             for f in os.listdir(path):
                 fp = os.path.join(path, f)
@@ -190,10 +199,6 @@ def filter_with_clip(
                     pass
         else:
             os.makedirs(path, exist_ok=True)
-
-    uncertain_folder = os.path.join(output_folder, "uncertain") if include_uncertain else None
-    if include_uncertain:
-        os.makedirs(uncertain_folder, exist_ok=True)
 
     # ---------------------------------------------------------------------
     # Load model once and embed all labels
@@ -355,20 +360,48 @@ def filter_with_clip(
     # ---------------------------------------------------------------------
     # Write scores JSON once at the end
     # ---------------------------------------------------------------------
+    created_dt = datetime.now(timezone.utc)
+    run_id_base = created_dt.strftime("%Y%m%dT%H%M%SZ")
+    run_dir = os.path.join(output_folder, "clip_similarity_scores_runs")
+    os.makedirs(run_dir, exist_ok=True)
+
+    def _snapshot_path_for(run_id_candidate: str) -> str:
+        stem, ext = os.path.splitext(scores_json_name)
+        return os.path.join(run_dir, f"{stem}_{run_id_candidate}{ext or '.json'}")
+
+    run_id = run_id_base
+    snapshot_path = _snapshot_path_for(run_id)
+    suffix = 2
+    while os.path.exists(snapshot_path):
+        run_id = f"{run_id_base}_{suffix:02d}"
+        snapshot_path = _snapshot_path_for(run_id)
+        suffix += 1
+
+    payload = {
+        "created_utc": created_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": run_id,
+        "input_folder": input_folder,
+        "output_folder": output_folder,
+        "use_mean": bool(use_mean),
+        "include_uncertain": bool(include_uncertain),
+        "uncertainty_threshold": float(uncertainty_threshold),
+        "categories": categories,
+        "labels": all_labels,
+        "results": results,
+    }
+
     try:
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "input_folder": input_folder,
-                "output_folder": output_folder,
-                "use_mean": bool(use_mean),
-                "include_uncertain": bool(include_uncertain),
-                "uncertainty_threshold": float(uncertainty_threshold),
-                "categories": categories,
-                "labels": all_labels,
-                "results": results,
-            }, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"[CLIP] Wrote similarity scores JSON: {json_path}")
     except Exception as e:
         print(f"[CLIP] Failed to write JSON at {json_path}: {e}")
+
+    try:
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[CLIP] Wrote run snapshot JSON: {snapshot_path}")
+    except Exception as e:
+        print(f"[CLIP] Failed to write run snapshot JSON at {snapshot_path}: {e}")
 
     print(f"[CLIP] Done. Sorted {len(files)} images into subfolders of '{output_folder}'.")

@@ -4,11 +4,14 @@
 
 This report explains the current medical textbook pipeline to provide full documentation for accurate reproducibility. It also mentions potential issues and areas for improvement. It is based on the repository files in this project, especially `main.py` and the modules in `src/`.
 
-The goal of the pipeline is to turn medical textbook PDFs into research artifacts about representation in images and text. It extracts page text and figure crops, filters the crops with CLIP, estimates visible skin tone on skin-containing photographs, uses an OpenAI model to count explicit race and gender mentions in the extracted text, and then compiles final CSV datasets and summary plots.
+The goal of the pipeline is to turn medical textbook PDFs into research artifacts about representation in images and text. It extracts page text and figure crops, filters the crops with CLIP, estimates visible skin tone on skin-containing photographs, uses an OpenAI model to count explicit race and gender mentions in the extracted text, and compiles final CSV datasets and summary plots.
 
-This project is still very much work in progress, and the accuracy of certain modules could certainly be improved. New functionality, such as the classification of illustrations, would likely be helpful for downstream analysis.
+Many of the methods used in this pipeline, especially the skin segmentation and tone classification, are based on methods used by [Adukia et al](https://doi.org/10.1093/qje/qjad028). Refer to their in-depth explanations for more information and justifications.
+
+This project is still very much a work in progress, and the accuracy of certain modules could certainly be improved. New functionality, such as the classification of illustrations, would likely be helpful for downstream analysis.
 
 For any questions regarding this report or the repository, contact Vincent Zhu at vzhu08@gmail.com or 610-808-7989.
+
 ## Table of Contents
 
 | Section | What it explains                                                                                                                                        |
@@ -20,9 +23,7 @@ For any questions regarding this report or the repository, contact Vincent Zhu a
 | [5. Safe Reruns and Cache Invalidation](#5-safe-reruns-and-cache-invalidation) | How cached artifacts behave and which folders to remove when rerunning changed stages.                                                                  |
 | [6. Known Issues and Risks](#6-known-issues-and-risks) | Current technical, reproducibility, and methodological risks that should be understood before using results.                                            |
 | [7. Troubleshooting](#7-troubleshooting) | Common failure modes and practical checks for missing PDFs, dependency problems, model downloads, API failures, and empty outputs.                      |
-| [8. Reproducibility Checklist](#8-reproducibility-checklist) | The run metadata, files, model versions, manual reviews, and validation checks to record before accepting a run as reproducible.                        |
-| [9. Handoff Checklist for the Next RA](#9-handoff-checklist-for-the-next-ra) | The materials, notes, credentials guidance, outputs, and review records to provide to the next research assistant.                                      |
-| [10. Recommended Next Development Priorities](#10-recommended-next-development-priorities) | Suggested improvements for making the pipeline easier to configure, rerun, validate, and maintain.                                                      |
+| [8. Recommended Next Development Priorities](#8-recommended-next-development-priorities) | Suggested improvements for making the pipeline easier to configure, rerun, validate, and maintain.                                                      |
 
 ## 1. Introduction and Overview
 
@@ -104,23 +105,27 @@ data/fitzpatrick_9th_2023/
 |   |   |-- photo/
 |   |   |-- illus/
 |   |   |-- text/
-|   |   `-- clip_similarity_scores.json
+|   |   |-- clip_similarity_scores.json
+|   |   `-- clip_similarity_scores_runs/
 |   |-- if_skin/
 |   |   |-- skin/
 |   |   |-- no_skin/
-|   |   `-- clip_similarity_scores.json
+|   |   |-- clip_similarity_scores.json
+|   |   `-- clip_similarity_scores_runs/
 |   |-- gender/
 |   |   |-- male/
 |   |   |-- female/
 |   |   |-- uncertain/
-|   |   `-- clip_similarity_scores.json
+|   |   |-- clip_similarity_scores.json
+|   |   `-- clip_similarity_scores_runs/
 |   `-- race/
 |       |-- black/
 |       |-- white/
 |       |-- asian/
 |       |-- latine/
 |       |-- uncertain/
-|       `-- clip_similarity_scores.json
+|       |-- clip_similarity_scores.json
+|       `-- clip_similarity_scores_runs/
 |-- skin_class/
 |   |-- masks/
 |   |-- probs/
@@ -161,19 +166,19 @@ This design is rather clunky, but it was necessary to solve certain conflicts be
 
 ### 2.1 Python Environment
 
-Use a clean virtual environment on Python 3.12.8. Version are rather finicky, so make sure the venv is set up correctly.
+Use a clean virtual environment on Python 3.12.8. Versions are rather finicky, so make sure the venv is set up correctly.
 
 ### 2.2 Install Dependencies
 
 The packages used in this pipeline must be installed in a very specific order to prevent conflicts. Recommended order:
 
 1. Create and activate a clean virtual environment.
-2. Install the correct PaddlePaddle 3.1.0 build for the machine. Locate correct command at: https://www.paddlepaddle.org.cn/install/old?docurl=/documentation/docs/zh/develop/install/pip/windows-pip.html
+2. Install the correct PaddlePaddle 3.1.0 build for the machine. Locate the correct command on the [PaddlePaddle install page](https://www.paddlepaddle.org.cn/install/old?docurl=/documentation/docs/zh/develop/install/pip/windows-pip.html).
 3. If the PaddlePaddle install page gives a newer default command, adjust it to install version 3.1.0.
 4. Run `pip install paddleocr[all]`.
 5. Install the correct PyTorch build for the machine.
 6. Install remaining requirements from `requirements.txt`.
-7. Ensure GPU availability on the machine
+7. Ensure GPU availability on the machine.
 
 The current `requirements.txt` lists:
 
@@ -200,7 +205,11 @@ openai
 python-dotenv
 ```
 
-Reference `environment_freeze.txt` for exact versions. PaddlePaddle versions will likely differ due to different CUDA versions.
+`requirements.txt` documents the required packages, but most packages are not pinned there. `environment_freeze.txt` is the more exact snapshot of the environment used for this report, but it is a captured environment record rather than a fully curated cross-machine lock file. PaddlePaddle versions may still differ by CUDA version and hardware.
+
+Note:
+
+- If the machine/server is not a Windows machine with an NVIDIA GPU, you may need to tweak the PaddleOCR download and code. Paddle should support other GPUs, though. The [custom PaddlePaddle download page](https://www.paddlepaddle.org.cn/install/FastDeploy?docurl=/documentation/docs/zh/develop/install/pip/windows-pip.html) allows a customized install command; again, ensure it is 3.1.0.
 
 ### 2.3 External Model Files
 
@@ -209,6 +218,7 @@ The skin-classification stage expects the ABD skin-segmentation checkpoint here:
 ```text
 models/abd-skin-segmentation/final_unet_pytorch.pth
 ```
+
 The correct model is already in the repo, but you can download it here: https://github.com/MRE-Lab-UMD/abd-skin-segmentation/blob/master/Models/final_unet_pytorch.pth
 
 ### 2.4 Input PDFs and Naming Convention
@@ -259,13 +269,15 @@ On Windows, use the virtual environment's Python executable if `python` does not
 
 The pipeline is controlled by constants near the top of `main.py`. There is no command-line interface yet.
 
+This table documents the intended/default full-run settings. The current checked-out `main.py` may not match these values if flags were edited during testing or partial reruns.
+
 | Flag |                                         Default value | Meaning                                                                                            |
 |---|------------------------------------------------------:|----------------------------------------------------------------------------------------------------|
 | `RUN_EXTRACTION` |                                                `True` | Run text extraction, page rendering, and crop extraction                                           |
 | `RUN_FILTER_PHOTO` |                                                `True` | Sort crops into photo, illustration, or text                                                       |
 | `RUN_FILTER_SKIN` |                                                `True` | Sort photos into skin or no-skin                                                                   |
 | `RUN_FILTER_GENDER` |                                                `True` | Sort skin photos into male, female, or uncertain                                                   |
-| `RUN_FILTER_RACE` |                                               `False` | Sort skin photos into race categories or uncertain                                                 |
+| `RUN_FILTER_RACE` |                                                `True` | Sort skin photos into race categories or uncertain                                                 |
 | `RUN_SKIN_CLASSER` |                                                `True` | Segment skin and estimate skin tone                                                                |
 | `RUN_TEXT` |                                                `True` | Run OpenAI text analysis                                                                           |
 | `RUN_SUMMARIZE` |                                                `True` | Build final datasets, plots, and summary files                                                     |
@@ -273,14 +285,17 @@ The pipeline is controlled by constants near the top of `main.py`. There is no c
 | `USE_GPU` |                                                `True` | Allow GPU use where supported (pipeline likely breaks if this is false. CPU use is not supported). |
 | `abd_model_path` | `models/abd-skin-segmentation/final_unet_pytorch.pth` | ABD checkpoint path                                                                                |
 
-The pipeline is currently intended to run without `RUN_FILTER_RACE` as it does not produce accurate results.
+Note:
+
+- The pipeline may be run without `RUN_FILTER_RACE` because it does not produce accurate results. This will result in an empty race column in the final image dataset.
 
 ## 4. Module-by-Module Guide
-Each section hear explains each module in detail, providing:
+Each section here explains each module in detail, providing:
+
 - The flag to enable/disable it
 - The main function
 - Purpose
-- Tools and libraries used
+- Tools and services/libraries used
 - Inputs and outputs
 - Step-by-step behavior
 - Cache behavior
@@ -303,6 +318,12 @@ process_pdf(pdf_path: str)
 Purpose:
 
 `main.py` is the only normal entry point. It finds PDFs, creates output folders, runs each enabled stage, and prints timing summaries.
+
+Tools and services:
+
+- Python subprocess calls: run each enabled stage in a fresh interpreter so heavy libraries such as PaddleOCR, CLIP, and PyTorch do not remain loaded across unrelated stages.
+- JSON argument files: pass stage arguments into subprocess entry points in a structured way, including paths, flags, and model settings.
+- Repository folder conventions: define the expected `textbook_inputs/`, `data/<pdf-stem>/`, `models/`, and per-stage output layout that later modules rely on.
 
 Inputs:
 
@@ -368,12 +389,12 @@ Purpose:
 
 This module renders PDF pages, extracts page text boxes, creates page-structured Markdown, and prepares text boxes used by image extraction.
 
-Tools and libraries:
+Tools and services:
 
-- PyMuPDF (`fitz`) for page rendering and native PDF text blocks
-- `pymupdf4llm` for Markdown and word/line structure
-- PaddlePaddle and PaddleOCR `PPStructureV3` for OCR fallback
-- OpenCV and NumPy for image I/O
+- PyMuPDF (`fitz`): renders PDF pages to high-resolution JPEGs and extracts native PDF text blocks when a text layer already exists.
+- `pymupdf4llm`: converts the PDF text layer into page-separated Markdown plus word and line structure for later text analysis and auditing.
+- PaddleOCR `PPStructureV3` with PaddlePaddle: provides the OCR fallback for scanned PDFs that have no extractable native text boxes.
+- OpenCV: writes rendered page images that become the shared visual input for text-box validation and image extraction.
 
 Inputs:
 
@@ -405,6 +426,13 @@ extracted_images/text_structure.json
 extracted_images/pm4l_page_index.json
 extracted_images/compiled_text_boxes.json
 ```
+
+Important artifact fields:
+
+- `text_boxes_pages/pageNNN.json`: contains `page` and `entries`; each entry has `rect` as `[x, y, width, height]` in rendered-page pixels and `text` as the extracted text in that rectangle.
+- `text_structure.json`: keyed by `pageNNN`; each page stores `page`, `words`, and `lines`. Word entries include `text`, `bbox`, `block`, `line`, and `index`; line entries include `text`, `bbox`, `block`, and `line`.
+- `pm4l_page_index.json`: list of page records with `page`, `start`, and `end` character offsets into `pm4l.md`.
+- `compiled_text_boxes.json`: readability/audit file with `pages`, `items_by_page`, and `counts`. Each `items_by_page[pageNNN]` entry has normalized `rect` and `text`.
 
 Cache behavior:
 
@@ -444,11 +472,11 @@ Purpose:
 
 This module finds likely figure regions on each rendered page and saves them as image crops.
 
-Tools and libraries:
+Tools and services:
 
-- `src.text_extraction` for page images and text boxes
-- OpenCV and NumPy for whiteboxing, thresholding, connected components, resizing, and JPEG writing
-- `ThreadPoolExecutor` for per-page processing
+- `src.text_extraction`: supplies rendered page images and per-page text boxes so image extraction can remove text regions before looking for figures.
+- OpenCV: performs the core image-processing steps, including text whiteboxing, adaptive thresholding, connected components, crop resizing, overlay generation, and JPEG writing.
+- Per-page worker pool: processes independent pages concurrently when multiple workers are available.
 
 Inputs:
 
@@ -491,6 +519,12 @@ extracted_images/bbox_pages/page001.json
 extracted_images/bboxes.json
 extracted_images/manifest.json
 ```
+
+Important artifact fields:
+
+- `bbox_pages/pageNNN.json`: list of detected figure boxes for one page; each item has `rect` as `[x, y, width, height]` in rendered-page pixels. Empty list means no boxes were detected on that page.
+- `bboxes.json`: combined page-to-box map; keys are `pageNNN` and values are lists of `[x, y, width, height]` boxes.
+- `manifest.json`: contains `pages` and `timings`. Each `pages[pageNNN]` record includes `text` entries used for whiteboxing, `bboxes`, `crops` with crop `rect` and `file`, and per-page timing fields. Cached page skips include `cached_page: True` in timings.
 
 Optional inspection outputs when `save_mode="all"`:
 
@@ -544,16 +578,14 @@ filter_with_clip(
 
 Purpose:
 
-This reusable module routes images into category folders using CLIP similarity to prompt lists. This lists can be found in `main.py` and were constructed over many trials of test runs. Accuracy can likely still be improved by adding/change/removing prompts from these lists.
+This reusable module routes images into category folders using CLIP similarity to prompt lists. These lists can be found in `main.py` and were constructed over many trial runs. Accuracy can likely still be improved by adding, changing, or removing prompts from these lists.
 
-Tools and libraries:
+Tools and services:
 
-- Hugging Face Transformers `CLIPModel`
-- `CLIPTokenizer`
-- `CLIPImageProcessor`
-- PyTorch
-- Pillow
-- NumPy
+- Hugging Face Transformers CLIP (`CLIPModel`, `CLIPTokenizer`, and `CLIPImageProcessor`): loads `openai/clip-vit-base-patch32`, embeds category prompts, and prepares image inputs for the model.
+- PyTorch: runs CLIP inference on GPU when available or CPU otherwise, including batched image embedding.
+- Pillow: opens routed image crops and converts them to RGB before CLIP preprocessing.
+- NumPy: aggregates prompt-level similarity scores into category means, maxima, top-2 margins, and routing metadata.
 
 Model:
 
@@ -566,7 +598,7 @@ General step-by-step behavior:
 1. If `clip_similarity_scores.json` and the expected category folders already exist in the stage output folder, skip CLIP inference and reuse the existing routed outputs.
 2. Create one output folder for each category.
 3. Clear existing files inside category folders.
-4. Create `uncertain/` if `include_uncertain=True`.
+4. If `include_uncertain=True`, create or clear `uncertain/` using the same rerun logic as the category folders.
 5. Load CLIP model, tokenizer, and image processor.
 6. Tokenize all prompt labels and compute normalized CLIP text embeddings.
 7. Collect images from `input_folder` with `.jpg`, `.jpeg`, `.png`, or `.bmp` extensions.
@@ -577,29 +609,29 @@ General step-by-step behavior:
 12. Choose a category using either per-category mean or max, depending on `use_mean`.
 13. If uncertainty is enabled, route to `uncertain/` when the top-1 minus top-2 margin is below `uncertainty_threshold`.
 14. Copy each image to its routed category folder.
-15. Write `clip_similarity_scores.json`.
+15. Write the latest scores to `clip_similarity_scores.json`.
+16. Write a timestamped historical copy to `clip_similarity_scores_runs/clip_similarity_scores_<run_id>.json`.
 
 Output JSON contents:
 
-- source input and output folders
-- category prompt lists
-- flattened prompt labels
-- per-image `routed_to`
-- per-image `uncertain`
-- top-1 and top-2 category scores
-- top-2 margin
-- per-label scores
-- per-category mean and max scores
-- decision scores used for routing
+- `created_utc`: UTC timestamp for the CLIP run.
+- `run_id`: filesystem-safe timestamp ID also used in the historical snapshot filename.
+- `input_folder` and `output_folder`: source image folder and destination routing folder.
+- `use_mean`: whether routing used category mean scores instead of category max scores.
+- `include_uncertain`: whether low-margin decisions were routed to `uncertain/`.
+- `uncertainty_threshold`: top-1 minus top-2 margin threshold for uncertain routing.
+- `categories`: category-to-prompt-list mapping used for this run.
+- `labels`: flattened prompt list embedded by CLIP.
+- `results`: one record per image. Each record includes `filename`, `source_path`, `routed_to`, `uncertain`, `margin_top2`, `top1`, `top2`, `per_label`, `per_category_mean`, `per_category_max`, and `decision_scores`.
 
 Cache behavior:
 
-If the stage's `clip_similarity_scores.json` and expected category folders exist, the CLIP module returns before loading CLIP, clearing category folders, or copying images. Delete the relevant CLIP output folder to force rerouting.
+If the stage's `clip_similarity_scores.json` and expected category folders exist, the CLIP module returns before loading CLIP, clearing category folders, copying images, or writing a new historical snapshot. Delete the relevant CLIP output folder or cache artifacts to force rerouting.
 
 General notes:
 
-- Category folders are cleared before routing, but the optional `uncertain/` folder is created without clearing old files.
-- Prompt changes are only recorded in the overwritten score JSON.
+- `clip_similarity_scores.json` is the latest-run file used by downstream summarization.
+- Timestamped JSON snapshots under `clip_similarity_scores_runs/` preserve historical prompt lists, settings, and routing decisions from non-cached reruns.
 - The module assumes at least two categories because it compares top-1 and top-2 decisions.
 
 #### Stage 2: Photo vs Illustration vs Text
@@ -635,7 +667,7 @@ Validation:
 
 Notes:
 
-- Accuracy has been very high here, upwards of 95%
+- Accuracy has been very high here, upwards of 95%, from manual estimates.
 
 #### Stage 3: Skin vs No-Skin
 
@@ -668,7 +700,7 @@ Validation:
 
 Notes:
 
-- Accuracy is also high here, upwards of 90%
+- Accuracy is also high here, upwards of 90%, from manual estimates.
 
 #### Stage 4: Image Gender Routing
 
@@ -700,7 +732,7 @@ Validation:
 
 Notes:
 
-- Accuracy is surprisingly high here, around 75% for identifiable images.
+- Accuracy is surprisingly high here, around 75% for identifiable images, from manual estimates.
 
 #### Stage 5: Image Race Routing
 
@@ -732,7 +764,7 @@ Validation:
 
 Notes:
 
-- Accuracy is pretty abysmal here, less than 40% for identifiable images.
+- Accuracy is pretty abysmal here, less than 40% for identifiable images, from manual estimates.
 
 ### 4.5 Module 4: Skin Tone Classification - `src.skin_classification.classify_skin(...)`
 
@@ -764,14 +796,13 @@ Purpose:
 
 This module segments visible skin, computes a representative skin color, calculates Individual Typology Angle (ITA), and maps ITA to a Monk Skin Tone category.
 
-Tools and libraries:
+Tools and services:
 
-- PyTorch for the inline UNet architecture and checkpoint inference
-- ABD skin-segmentation checkpoint
-- OpenCV and NumPy for image processing
-- `pydensecrf` for DenseCRF mask refinement
-- scikit-learn `KMeans` for color clustering
-- CSV output via the standard library
+- PyTorch: runs the inline UNet architecture and ABD checkpoint inference.
+- ABD skin-segmentation checkpoint: provides the trained segmentation weights for visible-skin masks.
+- OpenCV and NumPy: handle mask cleanup, color conversion, pixel extraction, and image writing.
+- `pydensecrf`: optionally refines masks with DenseCRF using image edges.
+- scikit-learn `KMeans`: clusters skin pixels to estimate a representative skin color.
 
 Inputs:
 
@@ -823,6 +854,8 @@ Cache behavior:
 
 If both `skin_tones.csv` and `fallbacks.csv` already exist, `classify_skin(...)` returns before loading the ABD model or processing images. Delete `skin_class/` to force a full skin-classification rerun.
 
+If the CSVs are missing, the stage may still reuse existing per-image artifacts. Existing masks can skip segmentation for those images, and existing postprocessing outputs can skip parts of mask refinement, clustering, or representative-color writing.
+
 `skin_tones.csv` columns:
 
 ```text
@@ -835,6 +868,26 @@ ITA
 monk_tone
 ```
 
+Column descriptions:
+
+- `filename`: image filename from `sorted_images/if_skin/skin/`.
+- `skin_tint_0_100`: representative L* lightness value scaled 0 to 100.
+- `rep_L`, `rep_a`, `rep_b`: representative CIE Lab color values from the weighted top skin-color clusters.
+- `ITA`: Individual Typology Angle calculated from representative L* and b*.
+- `monk_tone`: Monk Skin Tone category, 1 through 10.
+
+`fallbacks.csv` columns:
+
+```text
+filename
+crf_coverage_0_1
+```
+
+Column descriptions:
+
+- `filename`: image whose DenseCRF-refined mask covered too little area and used HSV fallback.
+- `crf_coverage_0_1`: fraction of image pixels covered by the CRF mask before fallback.
+
 Validation:
 
 - Inspect masks and masked composites.
@@ -843,10 +896,9 @@ Validation:
 - Check cluster swatches and representative color chips.
 - Review distribution plots later generated by the summarizer.
 
-Important caveats:
+Notes:
 
-- CSV rows from previous runs are preserved and updated unless `skin_class/` is removed.
-- Existing masks cause segmentation to skip images.
+- It may be preferable to remove the HSV fallback to ensure the same method is used to classify all images. Masks without sufficient pixels would then be omitted from final results.
 - Any change to checkpoint, threshold, CRF settings, fallback logic, or input images should be followed by deleting `skin_class/` and rerunning this stage.
 
 ### 4.6 Module 5: Text Analysis - `src.text_parser.analyze_text_llm(...)`
@@ -873,6 +925,8 @@ Purpose:
 
 This module counts explicit race and gender mentions in the extracted textbook text.
 
+It only evaluates sentences that first match the race or gender keyword/regex candidate rules. It counts explicit textual mentions only. Race and gender results are page-level text counts, and model notes may record near-miss terms that were rejected.
+
 Tools and services:
 
 - OpenAI Python package
@@ -897,20 +951,17 @@ OPENAI_API_KEY
 Step-by-step behavior:
 
 1. Load `.env` with `load_dotenv()`.
-2. Find the first Markdown file under the input directory. Under the normal layout, this is `extracted_images/pm4l.md`.
-3. Split Markdown into pages using `## Page NNN` headings and page anchors.
-4. Split each page into sentences with punctuation-based regex splitting.
-5. Save or reuse `sentences_by_page.json`.
-6. Use word-boundary regexes to find race candidate sentences.
-7. Use word-boundary regexes to find gender candidate sentences.
-8. Save or reuse `race_candidates.json` and `gender_candidates.json`.
-9. Run race and gender classification concurrently.
-10. Batch up to 10 candidate sentences per API call.
-11. Use Chat Completions JSON mode.
-12. Ask the model to return compact JSON with labels and notes.
-13. Aggregate labels and notes by page.
-14. Save raw batch responses when enabled.
-15. Write `race_results.json` and `gender_results.json`.
+2. If `reuse_existing_outputs=True` and both `race_results.json` and `gender_results.json` exist, return those final outputs immediately.
+3. If final outputs are missing, find the first Markdown file under the input directory. Under the normal layout, this is `extracted_images/pm4l.md`.
+4. If `sentences_by_page.json` exists, reuse it; otherwise read the Markdown, split it into pages using `## Page NNN` headings and page anchors, split pages into sentences, and write `sentences_by_page.json`.
+5. If `race_candidates.json` and `gender_candidates.json` exist, reuse them; otherwise use word-boundary regexes to find race and gender candidate sentences and write both candidate JSONs.
+6. Run race and gender classification concurrently.
+7. Batch up to `BATCH_SIZE = 10` candidate sentences per API call.
+8. Use Chat Completions JSON mode.
+9. Ask the model to return compact JSON with labels and notes.
+10. Aggregate labels and notes by page.
+11. Save raw batch responses when enabled.
+12. Write `race_results.json` and `gender_results.json`.
 
 Primary outputs:
 
@@ -923,6 +974,14 @@ text_analysis/gender_api_batches/batch_0001.json
 text_analysis/race_results.json
 text_analysis/gender_results.json
 ```
+
+Important artifact fields:
+
+- `sentences_by_page.json`: maps page number strings to ordered lists of sentence strings extracted from `pm4l.md`.
+- `race_candidates.json` and `gender_candidates.json`: contain `total_candidates`, `counts_per_page`, and `candidates`. Each candidate has `page`, `index_on_page`, and `text`.
+- `race_api_batches/batch_NNNN.json` and `gender_api_batches/batch_NNNN.json`: raw compact JSON responses returned by the OpenAI model for each API batch.
+- `race_results.json` and `gender_results.json`: contain `model`, `created_utc`, `usage`, and `per_page`. Each `per_page` record has `total_sentences`, `counts`, `sentences`, and `notes`. Sentence records include `index_on_page`, `text`, `labels`, and `notes`.
+- `usage`: records `batches`, `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens`, `cost_usd`, and `pricing_per_1M`.
 
 Race labels used by the text parser:
 
@@ -940,20 +999,28 @@ male
 female
 ```
 
+Cache behavior:
+
+If `reuse_existing_outputs=True` and both `race_results.json` and `gender_results.json` already exist, the module returns immediately and reuses those final outputs.
+
+If either final result file is missing, the module continues but still reuses intermediate prep files when present:
+
+- `sentences_by_page.json` is reused instead of re-splitting `pm4l.md`.
+- `race_candidates.json` and `gender_candidates.json` are reused instead of re-running keyword candidate mining.
+- Missing candidate totals are backfilled into older candidate JSONs when needed.
+
+Delete `text_analysis/` or the specific cached JSON files before rerunning if Markdown extraction, candidate regexes, prompt instructions, model settings, or cost settings change.
+
 Validation:
 
 - Review candidate JSON files to check missed or overly broad keyword matches.
 - Review raw batch JSONs for malformed or empty model outputs.
 - Manually compare a sample of per-page results with `pm4l.md`.
-- Record model name, run date, prompts, token usage, and actual billed cost.
 
-Important caveats:
+Notes:
 
-- Existing `race_results.json` and `gender_results.json` are reused by default.
-- Candidate JSONs are reused if present.
-- Cost estimates depend on hard-coded prices and should be verified.
-- Race and gender tasks share one budget, but concurrent in-flight requests can overshoot a cap.
-- Persistent rate limits may lead to repeated resubmission.
+- The prompt can be found in `text_parser.py` and was refined over several test runs.
+- There is a cost estimate and cap that can be raised or removed for large runs; prices are also hard-coded and might be old or inaccurate.
 
 ### 4.7 Module 6: Summarization - `src.summarize_results.summarize_results(...)`
 
@@ -971,12 +1038,12 @@ Purpose:
 
 This module creates final research-facing datasets and summary plots for one textbook folder.
 
-Tools and libraries:
+Tools and services:
 
-- pandas
-- NumPy
-- Matplotlib
-- JSON and CSV files from upstream stages
+- pandas: reads upstream CSV/JSON-derived tables and writes the final image and text datasets.
+- NumPy: supports numeric summaries and plot preparation.
+- Matplotlib: writes final summary plots.
+- Upstream JSON and CSV artifacts: provide page counts, skin-tone values, CLIP routes, and text-analysis counts.
 
 Inputs:
 
@@ -988,6 +1055,17 @@ data/<pdf-stem>/sorted_images/gender/clip_similarity_scores.json
 data/<pdf-stem>/text_analysis/race_results.json
 data/<pdf-stem>/text_analysis/gender_results.json
 ```
+
+Required upstream artifacts before summarization:
+
+| Artifact | Used for |
+|---|---|
+| `extracted_images/page_images/` | Counts total textbook pages. |
+| `skin_class/skin_tones.csv` | Creates image dataset rows and supplies skin-tone fields. |
+| `sorted_images/race/clip_similarity_scores.json` | Fills image race route fields when available. |
+| `sorted_images/gender/clip_similarity_scores.json` | Fills image gender route fields when available. |
+| `text_analysis/race_results.json` | Supplies page-level race mention counts. |
+| `text_analysis/gender_results.json` | Supplies page-level gender mention counts. |
 
 Step-by-step behavior:
 
@@ -1038,6 +1116,19 @@ Race
 Gender
 ```
 
+Column descriptions:
+
+- `Photo_id`: crop filename from `skin_tones.csv`, such as `0001_002.jpg`.
+- `Page number`: page parsed from the crop filename.
+- `Total pages in the book`: count of files in `extracted_images/page_images/`.
+- `Book name`: first underscore-separated part of the textbook folder name.
+- `Edition number`: numeric edition parsed from the second folder-name part.
+- `Year of release of edition`: four-digit year parsed from the third folder-name part.
+- `Skin tone estimate`: `skin_tint_0_100` value copied from `skin_tones.csv`.
+- `Monk skin tone`: `monk_tone` value copied from `skin_tones.csv`.
+- `Race`: CLIP route from `sorted_images/race/clip_similarity_scores.json`, matched by filename.
+- `Gender`: CLIP route from `sorted_images/gender/clip_similarity_scores.json`, matched by filename.
+
 Text dataset columns:
 
 ```text
@@ -1054,6 +1145,16 @@ Male
 Female
 ```
 
+Column descriptions:
+
+- `Page number`: textbook page number.
+- `Total pages in the book-edition`: count of files in `extracted_images/page_images/`.
+- `Book name`: first underscore-separated part of the textbook folder name.
+- `Edition number`: numeric edition parsed from the second folder-name part.
+- `Year of release of edition`: four-digit year parsed from the third folder-name part.
+- `White`, `Black`, `Asian`, `Latine`: page-level counts of explicit race mentions from `race_results.json`; `Latine` maps from the parser's `latino` label.
+- `Male`, `Female`: page-level counts of explicit gender mentions from `gender_results.json`.
+
 Validation:
 
 - Confirm image row count equals the number of rows in `skin_tones.csv`.
@@ -1063,14 +1164,17 @@ Validation:
 - Compare text totals with `race_results.json` and `gender_results.json`.
 - Open generated plots and check for plausible values.
 
-Important caveats:
+Notes:
 
+- Cross-textbook dataset generation is not yet implemented.
+- A useful future improvement would be replacing the final CSVs with an actual database, from a library like SQLite.
 - Missing upstream files often result in empty datasets or empty fields rather than a hard error.
 - Image dataset rows are created from `skin_tones.csv`; images without skin-tone rows do not appear.
-- The image dataset reads some skin-tone values by column position, so schema changes to `skin_tones.csv` can break or misalign fields.
-- The text dataset uses `Latine` as the output column but reads the `latino` key from `text_parser.py`.
+- `summarize_results.py` reads some skin-tone CSV fields by column position; be careful when adding new columns.
 
 ## 5. Safe Reruns and Cache Invalidation
+
+Cache behavior is documented for each module above; this section summarizes all behavior.
 
 The pipeline is partially resumable, but it does not fingerprint source PDFs, code, prompts, model versions, thresholds, or package versions. When in doubt, remove stale downstream artifacts before rerunning.
 
@@ -1088,7 +1192,8 @@ Image extraction cache:
 CLIP cache:
 
 - Reuses the whole CLIP stage when `clip_similarity_scores.json` and the expected category folders exist in that stage's output folder.
-- If the JSON is missing, category folders are cleared and rebuilt.
+- If the JSON is missing, category folders and `uncertain/` when enabled are cleared and rebuilt.
+- Non-cached reruns write the latest scores to `clip_similarity_scores.json` and preserve timestamped copies in `clip_similarity_scores_runs/`.
 - Delete the relevant CLIP output directory and downstream stages after changing prompts, thresholds, input crops, or model versions.
 
 Skin classification cache:
@@ -1108,22 +1213,27 @@ Summary cache:
 - Reuses the whole module when `image_dataset.csv`, `text_dataset.csv`, and `summary.txt` exist.
 - Rerun summarization after any upstream change.
 
+Run acceptance checklist:
+
+- Confirm `extracted_images/pm4l.md`, `bboxes.json`, and `manifest.json` exist.
+- Confirm expected CLIP `clip_similarity_scores.json` files exist for enabled CLIP stages.
+- Confirm `skin_class/skin_tones.csv` exists when image dataset rows are expected.
+- Confirm `text_analysis/race_results.json` and `gender_results.json` exist when text counts are expected.
+- Confirm `final_datasets/image_dataset.csv`, `text_dataset.csv`, and `summary.txt` exist.
+- Open the final datasets and check that row counts, book metadata, page numbers, and key race/gender/skin-tone fields are not unexpectedly blank.
+
 ## 6. Known Issues and Risks
+
+A summary of issues mentioned for each module.
 
 1. Most package versions are not pinned.
 2. There is no command-line or config-file interface; stage flags are edited in `main.py`.
-3. The default run is incomplete for full demographic analysis.
-4. Cache validity is based mainly on file existence.
-5. OCR only runs when the whole PDF has zero native text boxes.
-6. OCR replaces scanned input PDFs in place with OCR-enhanced copies, so preserve raw originals separately when needed.
-7. CLIP `uncertain/` folders may retain stale files.
-8. Summarization may succeed with empty or incomplete upstream artifacts.
-9. `summarize_results.py` reads some skin-tone CSV fields by column position.
-10. OpenAI pricing is hard-coded and may become outdated.
-11. OpenAI cost caps can be exceeded by concurrent requests.
-12. Persistent rate limits may cause repeated text-analysis resubmissions.
-13. There is no automated test suite.
-14. Ethical and validity risks are substantial for image-based demographic labels.
+3. Cache validity is based mainly on file existence.
+4. OCR only runs when the whole PDF has zero native text boxes.
+5. OCR replaces scanned input PDFs in place with OCR-enhanced copies, so preserve raw originals separately when needed.
+6. Summarization may succeed with empty or incomplete upstream artifacts.
+7. `summarize_results.py` reads some skin-tone CSV fields by column position; be careful when adding new columns.
+8. Default OpenAI cost caps can be exceeded by concurrent requests.
 
 ## 7. Troubleshooting
 
@@ -1177,64 +1287,20 @@ Final datasets are empty:
 - Confirm `skin_class/skin_tones.csv` exists for image rows.
 - Confirm CLIP race/gender JSONs exist if race/gender fields are expected.
 - Confirm `text_analysis/race_results.json` and `gender_results.json` exist for text counts.
-- Remember that the current default flags do not produce a complete run.
+- Remember that final datasets may be incomplete if required upstream stages were disabled.
 
-## 8. Reproducibility Checklist
+## 8. Recommended Next Development Priorities
 
-Before accepting a run as reproducible, record or verify:
+Key functionality:
 
-- [ ] Repository commit hash or a copy of the exact source files.
-- [ ] Any uncommitted source modifications.
-- [ ] Python executable and Python version.
-- [ ] Full package export, such as `pip freeze`.
-- [ ] Operating system.
-- [ ] CPU, GPU, CUDA, and driver details.
-- [ ] PaddlePaddle, PaddleOCR, PaddleX, PyTorch, and Transformers versions.
-- [ ] ABD checkpoint source, file size, and checksum.
-- [ ] Hugging Face CLIP model revision or cached model snapshot.
-- [ ] OpenAI model name, prompts, run date, token usage, and billed cost.
-- [ ] All `main.py` flags and worker/GPU settings.
-- [ ] Input PDF provenance and checksums.
-- [ ] Page-image count equals PDF page count.
-- [ ] Text boxes and Markdown manually inspected.
-- [ ] Figure crops manually inspected.
-- [ ] CLIP folders and low-margin outputs manually inspected.
-- [ ] Skin masks, fallback cases, clusters, and representative colors manually inspected.
-- [ ] LLM candidate sentences and final labels manually inspected.
-- [ ] Final CSV row counts checked against upstream artifacts.
-- [ ] Intermediate JSONs and manual review notes archived.
-- [ ] Exclusions, reruns, corrections, and unresolved failures documented.
+1. Implement classification for illustrations.
+2. Improve CLIP race identification, or use a new method.
 
-## 9. Handoff Checklist for the Next RA
-
-Provide:
-
-- [ ] This report.
-- [ ] The research question and approved interpretation of each generated label.
-- [ ] The exact textbook PDF list and provenance.
-- [ ] The latest code state or commit hash.
-- [ ] Environment setup notes and dependency export.
-- [ ] ABD model file or verified download instructions.
-- [ ] API setup instructions without exposing secret keys.
-- [ ] The current `main.py` configuration.
-- [ ] A stage-completion record for each textbook.
-- [ ] Paths to archived outputs.
-- [ ] Manual review procedures and completed review samples.
-- [ ] Known bad pages, bad crops, failed textbooks, and model failure patterns.
-- [ ] Manual corrections made after model inference.
-- [ ] Actual API costs.
-- [ ] Recommended next development priorities.
-
-## 10. Recommended Next Development Priorities
+Reproducibility and run-control improvements:
 
 1. Add a complete pinned dependency file.
 2. Replace source-edited flags with a config file or CLI.
 3. Write a run manifest containing input checksums, settings, model revisions, prompts, dependency versions, and source commit.
 4. Add cache fingerprints and dependency-aware invalidation.
 5. Add stage-level completeness checks before summarization.
-6. Add automated tests for page parsing, filename parsing, artifact schemas, ITA/Monk mapping, and final dataset joins.
-7. Preserve uncertainty scores and manual-review status in final datasets.
-8. Build a structured manual-review workflow for image and text labels.
-9. Reevaluate whether image-based race and gender routing should be used for the research question.
-
-Update this report whenever module interfaces, artifact schemas, prompts, models, dependencies, or research procedures change.
+6. Preserve uncertainty scores and manual-review status in final datasets.

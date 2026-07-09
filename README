@@ -6,7 +6,7 @@ Ignore the rest of this file and refer to the reproducibility report for in-dept
 
 
 
-
+OLD, IGNORE
 Please import requirements.txt before using
 
 If running PaddleOCR with GPU, install all Paddle dependencies first then torch. Ensure correct CUDA wheel.
@@ -20,9 +20,7 @@ Then run: pip install "paddleocr[all]"
 TODO
 internal anatomy filtering
 
-write guide
-
-OLD
+EVEN OLDER
 add setup files to download
 https://www.dropbox.com/s/d9fc9tahfzyl6df/model_final.pth?dl=1
 https://www.dropbox.com/s/u9wbsfwz4y0ziki/config.yml?dl=1
